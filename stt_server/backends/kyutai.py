@@ -4,10 +4,13 @@ Kyutai's delayed-streams models (``kyutai/stt-1b-en_fr-mlx``: English and
 French, CC-BY-4.0) run frame by frame: 24 kHz audio is encoded by the Mimi codec
 into 80 ms frames, and the language model emits a text token per frame about
 0.5 s behind the audio. V1 of this server is commit-oriented, so on ``end()``
-the whole buffered utterance is resampled, run through Mimi + the LM with 2 s of
-trailing silence to flush that delay, and returned as one ``delta`` plus one
-``completed`` (the same contract as the other backends). The reference loop is
-Kyutai's ``delayed-streams-modeling/scripts/stt_from_file_mlx.py``.
+the whole buffered utterance is resampled, padded as the model's ``stt_config``
+asks (leading silence; trailing silence to flush the text delay), run through
+Mimi + the LM, and returned as one ``delta`` plus one ``completed`` (the same
+contract as the other backends). The LM's KV cache is a rotating window, so an
+utterance can be any length. ``kyutai/stt-2.6b-en-mlx`` (English, larger and
+slower; 1 s prefix, 2.5 s delay) loads the same way via ``--model``. The
+reference loop is Kyutai's ``delayed-streams-modeling/scripts/stt_from_file_mlx.py``.
 
 Mirrors ``parakeet.py`` in structure: a lazy import of the optional ``kyutai``
 extra, a backend-scoped asyncio + threading decode-lock pair, daemon-thread
@@ -38,11 +41,9 @@ DEFAULT_KYUTAI_MODEL = "kyutai/stt-1b-en_fr-mlx"
 # Model frame: 80 ms at Mimi's 24 kHz.
 _MODEL_RATE_HZ = 24_000
 _FRAME_SAMPLES = 1920
-# Trailing silence that flushes the model's ~0.5 s text delay (as the reference).
-_FLUSH_SAMPLES = 2 * _MODEL_RATE_HZ
-# The LM's context is 3000 frames (240 s); keep the last 230 s of an utterance.
-# (The wire protocol caps a commit at 300 s.)
-_MAX_SAMPLES = 230 * _MODEL_RATE_HZ
+# Trailing silence flushes the text the model emits ``audio_delay_seconds`` behind
+# the audio: that delay plus a second, and never less than the reference's 2 s.
+_MIN_FLUSH_SECONDS = 2.0
 # Text tokens that carry no text (padding / end of word markers).
 _SKIP_TOKENS = (0, 3)
 
@@ -181,7 +182,13 @@ class KyutaiBackend:
             mimi = models.mimi.Mimi(models.mimi_202407(32))
             mimi.load_pytorch_weights(str(mimi_weights), strict=True)
             lm.warmup()
+            stt = raw.get("stt_config") or {}
+            delay = float(stt.get("audio_delay_seconds", 0.5))
             self._loaded = {
+                "prefix_samples": int(
+                    float(stt.get("audio_silence_prefix_seconds", 0.0)) * _MODEL_RATE_HZ
+                ),
+                "flush_samples": int(max(_MIN_FLUSH_SECONDS, delay + 1.0) * _MODEL_RATE_HZ),
                 "mx": mx,
                 "models": models,
                 "utils": utils,
@@ -199,8 +206,13 @@ class KyutaiBackend:
         m = self._get_model()
         mx, models, utils = m["mx"], m["models"], m["utils"]
         audio = np.frombuffer(pcm16, dtype="<i2").astype(np.float32) / 32768.0
-        audio = resample_16k_to_24k(audio)[-_MAX_SAMPLES:]
-        audio = np.concatenate([audio, np.zeros(_FLUSH_SAMPLES, dtype=np.float32)])
+        audio = np.concatenate(
+            [
+                np.zeros(m["prefix_samples"], dtype=np.float32),
+                resample_16k_to_24k(audio),
+                np.zeros(m["flush_samples"], dtype=np.float32),
+            ]
+        )
         frames = audio.size // _FRAME_SAMPLES
         x = mx.array(audio[None, : frames * _FRAME_SAMPLES])
         # Fresh streaming state per utterance: Mimi's encoder state and the LM's
