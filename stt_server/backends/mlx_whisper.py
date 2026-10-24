@@ -310,5 +310,12 @@ class MLXWhisperBackend(DecodeGuardMixin):
 def prefetch_specs(model: str | None) -> list[SnapshotSpec]:
     """Snapshots ``python -m stt_server prefetch --backend mlx`` fetches:
     ``mlx_whisper`` loads with an unfiltered ``snapshot_download``, so the whole
-    repo (``config.json`` plus ``weights.safetensors``/``weights.npz``)."""
-    return [SnapshotSpec(model or DEFAULT_MLX_MODEL, required=("config.json", "weights.*"))]
+    repo. Complete means the exact files its loader opens: ``config.json`` and
+    ``weights.safetensors``, else ``weights.npz`` (``load_models.load_model``);
+    a ``weights.*`` glob would also accept a file the loader never reads."""
+    return [
+        SnapshotSpec(
+            model or DEFAULT_MLX_MODEL,
+            required=("config.json", "weights.safetensors|weights.npz"),
+        )
+    ]

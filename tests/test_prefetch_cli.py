@@ -440,6 +440,31 @@ def test_local_model_uses_backend_required_patterns(tmp_path, monkeypatch, capsy
     assert events[-1]["cached"] is True
 
 
+@pytest.mark.parametrize(
+    "weights,cached",
+    [
+        ("weights.safetensors", True),
+        ("weights.npz", True),
+        ("weights.txt", False),  # matches ``weights.*``; mlx_whisper never reads it
+        ("sub/weights.safetensors", False),  # the loader opens model_path / name only
+    ],
+)
+def test_mlx_complete_means_the_files_its_loader_opens(
+    tmp_path, monkeypatch, capsys, weights, cached
+):
+    """Codex medium: ``required=("config.json", "weights.*")`` reported a
+    snapshot cached when it held no ``weights.safetensors`` / ``weights.npz``,
+    the only two files ``mlx_whisper.load_models.load_model`` opens."""
+    model = tmp_path / "custom"
+    (model / weights).parent.mkdir(parents=True, exist_ok=True)
+    (model / "config.json").write_text("{}")
+    (model / weights).write_bytes(b"w")
+    _code, events, _ = _run(
+        monkeypatch, capsys, "--backend", "mlx", "--model", str(model), "--check", "--json"
+    )
+    assert events[-1]["cached"] is cached
+
+
 def test_human_check_output(fake_hub, monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["stt_server", "prefetch", "--backend", "parakeet", "--check"])
     M.main()

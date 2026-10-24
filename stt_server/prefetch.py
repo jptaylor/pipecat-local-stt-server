@@ -194,8 +194,12 @@ def _snapshot_size(path: str | Path) -> int:
 
 
 def _complete(path: str | Path, required: tuple[str, ...]) -> bool:
+    """Every ``required`` entry matches a file; ``a|b`` matches either."""
     names = [str(p.relative_to(path)) for p in Path(path).rglob("*") if p.is_file()]
-    return all(any(fnmatch.fnmatch(n, pattern) for n in names) for pattern in required)
+    return all(
+        any(fnmatch.fnmatch(n, alt) for n in names for alt in entry.split("|"))
+        for entry in required
+    )
 
 
 # --- check / fetch ---------------------------------------------------------------

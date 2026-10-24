@@ -32,7 +32,8 @@ class SnapshotSpec:
     #: ``None`` downloads the whole repo (what ``mlx_whisper`` does).
     allow_patterns: tuple[str, ...] | None = None
     #: Glob patterns that must each match a file for the snapshot to count as
-    #: cached. Checked explicitly because older ``huggingface_hub`` releases
+    #: cached; ``a|b`` in one entry means either (``mlx_whisper`` reads
+    #: ``weights.safetensors``, else ``weights.npz``). Checked explicitly because older ``huggingface_hub`` releases
     #: return a partial snapshot folder from ``local_files_only=True``.
     required: tuple[str, ...] = ()
     kind: str = "model"
