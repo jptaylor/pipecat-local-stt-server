@@ -231,7 +231,9 @@ value starting with `/`, `./`, `../` or `~` (or an existing relative path) is a
 local path, anything else a Hub repo id. A local directory is never downloaded;
 `--check` reports it cached only if it holds every file the backend requires,
 and a fetch fails with `ModelInvalidError` if it does not. `kyutai` loads by Hub
-repo id only and rejects local paths.
+repo id only: `prefetch` rejects a local path for it (`ConfigError`), while
+`serve --backend kyutai --model <path>` passes the value to the Hub as a repo id
+and fails at model load.
 
 ```bash
 uv run python -m stt_server prefetch --backend parakeet --model ~/models/parakeet --check

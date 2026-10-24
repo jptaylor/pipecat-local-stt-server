@@ -23,25 +23,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ModelInvalidError` supervised/prefetch error code: the model snapshot is
   present but unusable (incomplete, corrupt or incomplete `config.json`, an
   incomplete local model directory), from `prefetch` and from the `kyutai`
-  loader in `serve`. `ConfigError` now covers only explicit configuration
-  rejections (`supervise.ConfigError`, a `ValueError` subclass: endpoint,
-  socket directory, malformed Hub repo id, unsupported local model path); a
-  bare `ValueError` from a model library is `BackendStartError`. The code list
-  is per repo (`tts_server` has `SocketPathConflict` and no
-  `ModelInvalidError`); supervisors should treat an unknown code as
-  `BackendStartError`. See README "Error codes (per repo)".
-- `serve(..., hard_exit_on_stop=False)`: a stop during startup/warm-up now
-  cancels the pending step (waiting at most the drain timeout) and shuts down
-  normally for in-process callers; the CLI passes `True` to keep the immediate
-  exit. **Behaviour change for in-process callers**, which previously got the
-  immediate `os._exit`.
-- `backends.BACKENDS` registry: CLI choices, `--model` defaults, construction and
-  the prefetch module map derive from one table. `SnapshotSpec` moved to the
-  stdlib-only `stt_server.snapshot` (still importable from `stt_server.prefetch`);
-  the optional backend `abort()` hook (`AbortableBackend`, now exported) and
-  module-level `prefetch_specs()` are documented in `stt_server/backend.py`;
-  `backends.import_backend()` is the one lookup-and-import; `--model` defaults
-  come only from the registry. README has an "Adding a backend" checklist.
+  loader in `serve`. The code list is per repo (`tts_server` has
+  `SocketPathConflict` and no `ModelInvalidError`); supervisors should treat an
+  unknown code as `BackendStartError`. See README "Error codes (per repo)".
+- `backends.BACKENDS` registry: CLI choices, construction and the prefetch
+  module map derive from one table. `SnapshotSpec` moved to the stdlib-only
+  `stt_server.snapshot` (still importable from `stt_server.prefetch`); the
+  optional backend hooks `abort()` (`AbortableBackend`, now exported) and
+  `idle()` (`IdleAwareBackend`) and module-level `prefetch_specs()` are
+  documented in `stt_server/backend.py`. `backends.import_backend()` is the one
+  lookup-and-import and returns the entry, module and class. README has an
+  "Adding a backend" checklist.
+- `TranscriptionServer.state` (`new`/`starting`/`running`/`stopping`/`stopped`)
+  and `holds_socket_lock`.
 - **`serve --supervised`** for a managing parent process: stdout carries only
   JSON lines (`ready` once listening and warm, with the real port; or `error`
   with a stable `code` such as `EADDRINUSE`, `ModuleNotFoundError`,
@@ -57,6 +51,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `kyutai/stt-1b-en_fr-mlx`, English + French, CC-BY-4.0). The extra is declared
   conflicting with `mlx` / `parakeet` / `nemotron` (moshi_mlx pins `mlx<0.27`,
   `huggingface-hub<0.29`), so the lockfile keeps their newer pins.
+
+### Changed
+
+- `serve(..., hard_exit_on_stop=False)` is the default: a stop during
+  startup/warm-up now cancels the pending step (waiting at most the drain
+  timeout) and shuts down normally for in-process callers, which previously got
+  the immediate `os._exit`. The CLI passes `True` to keep the immediate exit.
+- `ConfigError` covers only explicit configuration rejections: a bare
+  `ValueError` (for example from a model library during warm-up) is now
+  `BackendStartError`, not `ConfigError`. `ConfigError` (a `ValueError`
+  subclass: endpoint, socket directory, unknown backend, malformed Hub repo id,
+  unsupported local model path) lives in the stdlib-only `stt_server.errors`
+  and is exported as `stt_server.ConfigError`; `supervise.ConfigError` remains
+  as a re-export.
+- `--model` defaults come only from `backends.BACKENDS[...].default_model`.
+- `TranscriptionServer` is **single-use**: after `shutdown()` (in any state,
+  including before `start()`) `start()` raises `RuntimeError`; build a new
+  server to serve again. A failed or cancelled `start()` returns the server to
+  `new` and may be retried. `start()` while another `start()` is in flight
+  raises `RuntimeError` instead of racing it for the lock.
+- `backends.import_backend()` raises `ConfigError` for an unknown name (was
+  `KeyError`) and returns a `LoadedBackend` (`entry`, `module`, `cls`).
 
 ### Fixed
 
@@ -100,6 +116,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Session tasks that swallow cancellation past the shutdown grace keep the
   single-server lock until they finish (`TranscriptionServer.stuck_task_count`),
   and the CLI exits the process instead of hanging in `asyncio.run` teardown.
+  That exit no longer swallows a failure in flight (e.g. `backend.close()`
+  raising): it is printed and, under `--supervised`, emitted as the `error`
+  event, with exit status 1.
+- The start/shutdown lifecycle is one explicit state machine with the lock kept
+  on the server: a concurrent `start()` can no longer release the active
+  starter's lock; a `shutdown()` cancelled mid-drain cancels the sessions it
+  had not cancelled and keeps the lock until they finish; the lock also waits
+  for a backend decode thread that outlived its cancelled task (the `idle()`
+  hook, implemented by every Metal backend); a `shutdown()` during `start()`
+  now `close()`s a backend whose `start()` had completed; `shutdown()` removes
+  the Unix socket file it bound (only that inode).
+- `prefetch --check` reports a malformed Hub repo id as `ConfigError` (exit 1),
+  as a fetch does, instead of `cached: false`.
 - The `<socket>.lock` mode no longer depends on the umask (a `0777` umask made
   an unopenable mode-000 file); an unopenable existing lock reports `EACCES`
   with the remedy. The preflight probe opens it non-blocking and reads a FIFO,

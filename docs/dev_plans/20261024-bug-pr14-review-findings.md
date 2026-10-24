@@ -291,6 +291,49 @@ mutation-checked (reverting the fix makes it fail).
   = `BackendStartError`), "Adding a backend" checklist; operations.md kyutai
   note, lock-file details and the mixed-version upgrade caveat; CHANGELOG.
 
+## Review-gauntlet round 3 fixes
+
+Also below the marker; each fix mutation-checked.
+
+- **Lifecycle state machine (root cause of six findings).** The
+  `_started`/`_starting`/`_closing`/`_stuck_tasks` flags and the lock fd handed
+  to task done-callbacks are replaced by one `_State` enum
+  (`new -> starting -> running -> stopping -> stopped`) changed only through
+  `_transition` (a fixed table), with the lock fd always on the server
+  (`holds_socket_lock`). Invariants: the lock is held iff the state is
+  starting, running, or stopping with live work; it is released once, by a
+  failed start (`starting -> new`) or by `stopping -> stopped`, which waits for
+  every piece of live work (an in-flight start, the drain, leftover session
+  tasks read from the tasks themselves rather than from how far the drain got,
+  and the backend's new optional `idle()` future, so a decode thread behind a
+  cancelled task keeps the lock). Decisions: single-use after `shutdown()`
+  (`start()` raises), a failed start is retryable, a concurrent `start()`
+  raises without touching the lock, a cancelled `shutdown()` cancels the
+  sessions it left and keeps the lock, a start unwinding after
+  `backend.start()` returned `close()`s the backend, and the drain unlinks our
+  socket inode. Tests: `tests/test_server_lifecycle.py` (state x event matrix
+  plus concurrent start/shutdown, cancel during start/drain/close, decode
+  thread, `DecodeGuardMixin.idle()`).
+- **Stuck-task exit reports the failure.** `serve(on_fatal=...)`: the CLI
+  passes its reporter, so the `os._exit` path prints the error and emits the
+  supervised `error` event (exit 1). Subprocess test through `cli.main()`.
+- **`prefetch --check`** raises a config error (`HFValidationError`) instead of
+  reporting `cached: false`, matching a fetch.
+- **Structure.** `ConfigError` moved to the stdlib-only `stt_server.errors`
+  (`is_config_error`; re-exported by `supervise`, exported by the package); the
+  core no longer imports `supervise` at module load. `import_backend()` returns
+  entry, module and class and raises `ConfigError` for an unknown name, which
+  the CLI turns into its exit message.
+- **Docs.** CHANGELOG `Changed` section (hard-exit default, `ConfigError`
+  narrowing, registry defaults, single-use server, `import_backend`); README
+  kyutai sentence scoped to prefetch; serve `--model` comment points at the
+  registry; operations.md lock note; `backend.py` hook contracts.
+
+Quarantined (not changed): a cancelled `backend.start()` whose model load runs
+on a worker thread still releases the lock on unwind -- no current backend
+loads in `start()` (they load on first decode), and tracking it needs a
+`start()`-side hook.
+
 Needs owner decision (above the review marker, left untouched): the `Status:`
 line still reads In Progress, and Requirements say Kyutai local paths report
 `cached: false` in check mode while the code (and tests) report `ConfigError`.
