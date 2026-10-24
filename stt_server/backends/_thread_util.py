@@ -103,12 +103,39 @@ class DecodeGuardMixin:
             self._mark_inflight_end()
             raise
 
-    def _wait_inflight_drained(self, timeout_s: float) -> bool:
+    def _wait_inflight_drained(self, timeout_s: float | None) -> bool:
         with self._inflight_cond:
             return self._inflight_cond.wait_for(
                 lambda: self._inflight_count == 0,
                 timeout=timeout_s,
             )
+
+    def idle(self) -> "asyncio.Future[None]":
+        """A future that completes once no decode daemon thread is in flight.
+
+        The optional ``idle()`` hook (``stt_server.backend.IdleAwareBackend``):
+        a decode thread outlives a cancelled decode task, so the server cannot
+        tell from its own tasks whether the backend is still running work. It
+        keeps the single-server lock until this future completes. Never blocks
+        the loop: the wait runs on a daemon thread, which exits when the count
+        reaches zero (and is reaped with the process otherwise).
+        """
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[None] = loop.create_future()
+        with self._inflight_cond:
+            if self._inflight_count == 0:
+                fut.set_result(None)
+                return fut
+
+        def _wait() -> None:
+            self._wait_inflight_drained(None)
+            try:
+                loop.call_soon_threadsafe(_set_result_safe, fut, None)
+            except RuntimeError:
+                pass  # loop already closed: nobody is waiting any more
+
+        threading.Thread(target=_wait, daemon=True, name="decode-idle-wait").start()
+        return fut
 
     async def _drain_inflight(
         self, label: str, log: logging.Logger, timeout_s: float = 3.0
