@@ -37,7 +37,7 @@ import os
 import sys
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +59,9 @@ class SnapshotSpec:
     #: return a partial snapshot folder from ``local_files_only=True``.
     required: tuple[str, ...] = ()
     kind: str = "model"
+    #: Set only for an explicit local model reference. It bypasses Hub calls but
+    #: still uses this backend-owned spec's ``required`` completeness patterns.
+    local_path: str | None = None
 
 
 def is_local_model(model: str) -> bool:
@@ -83,6 +86,14 @@ def specs_for(backend: str, model: str | None) -> list[SnapshotSpec]:
     except KeyError:
         raise ValueError(f"unknown backend: {backend!r}") from None
     return list(importlib.import_module(module).prefetch_specs(model))
+
+
+def local_specs_for(backend: str, model: str) -> list[SnapshotSpec]:
+    """Attach an explicit local directory to the backend's structural specs."""
+    if backend == "kyutai":
+        raise ValueError("the kyutai backend does not support local model paths")
+    path = Path(model).expanduser()
+    return [replace(spec, local_path=str(path)) for spec in specs_for(backend, model)]
 
 
 # --- patchable seams -------------------------------------------------------------
@@ -172,13 +183,18 @@ def check_spec(spec: SnapshotSpec) -> dict[str, Any]:
         "path": None,
         "size_bytes": 0,
     }
-    try:
-        path = _snapshot_download(spec, local_files_only=True)
-    except ImportError:
-        raise
-    except Exception as exc:  # noqa: BLE001 - any miss (incl. incomplete snapshot) = not cached
-        logger.debug("prefetch: %s not cached (%s)", spec.repo_id, exc)
-        return row
+    if spec.local_path is not None:
+        path = spec.local_path
+        if not Path(path).is_dir():
+            return row
+    else:
+        try:
+            path = _snapshot_download(spec, local_files_only=True)
+        except ImportError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - any miss (incl. incomplete snapshot) = not cached
+            logger.debug("prefetch: %s not cached (%s)", spec.repo_id, exc)
+            return row
     if not _complete(path, spec.required):
         return row
     row.update(cached=True, path=path, size_bytes=_snapshot_size(path))
@@ -189,6 +205,21 @@ def fetch_spec(spec: SnapshotSpec, emit: Callable[[dict], None] | None) -> dict[
     """Download one snapshot (resumable). ``emit`` set = JSON progress events."""
     if emit is not None:
         emit({"event": "start", "repo": spec.repo_id, "revision": spec.revision, "kind": spec.kind})
+    if spec.local_path is not None:
+        path = spec.local_path
+        if not Path(path).is_dir():
+            raise FileNotFoundError(f"local model directory does not exist: {path}")
+        if not _complete(path, spec.required):
+            raise FileNotFoundError(f"{path}: local model is missing {', '.join(spec.required)}")
+        result = {
+            "event": "done",
+            "repo": spec.repo_id,
+            "path": path,
+            "size_bytes": _snapshot_size(path),
+        }
+        if emit is not None:
+            emit(result)
+        return result
     reporter: threading.Thread | None = None
     done = threading.Event()
     if emit is not None:
@@ -242,7 +273,11 @@ def run_prefetch(backend: str, model: str | None, *, check: bool, json_mode: boo
     with ctx:
         emit = supervise.emit if json_mode else None
         try:
-            specs = [] if model and is_local_model(model) else specs_for(backend, model)
+            specs = (
+                local_specs_for(backend, model)
+                if model and is_local_model(model)
+                else specs_for(backend, model)
+            )
             return (
                 _run_check(backend, model, specs, emit)
                 if check

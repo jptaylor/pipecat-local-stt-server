@@ -248,8 +248,19 @@ def _preflight_listener(args: argparse.Namespace) -> None:
                 probe.settimeout(0.5)
                 try:
                     probe.connect(str(path))
-                except OSError:
-                    return  # stale socket: start() replaces it
+                except TimeoutError as exc:
+                    raise OSError(
+                        errno.EADDRINUSE, f"a server may already be listening on {path}"
+                    ) from exc
+                except OSError as exc:
+                    if exc.errno in {errno.ECONNREFUSED, errno.ENOENT}:
+                        return  # narrowly proven stale: start() replaces it
+                    if exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                        raise OSError(
+                            errno.EADDRINUSE,
+                            f"a server may already be listening on {path}",
+                        ) from exc
+                    raise
             raise OSError(errno.EADDRINUSE, f"a server is already listening on {path}")
         return
     if not args.host or not args.port:
@@ -272,12 +283,16 @@ async def _warm(backend) -> None:
         pass
 
 
-async def _emit_ready(server) -> None:
-    """``ready`` callback for ``serve --supervised``: warm up, then one JSON line."""
+async def _prepare_ready(server) -> None:
+    """Warm the backend before the supervised ready event is published."""
+    await _warm(server.backend)
+
+
+def _emit_ready(server) -> None:
+    """Publish the sole supervised ready event after warm-up and a stop check."""
     from . import protocol as P
     from .supervise import emit
 
-    await _warm(server.backend)
     cfg = server.config
     emit(
         {
@@ -309,7 +324,12 @@ def _cmd_serve(args: argparse.Namespace) -> None:
     with supervise.json_channel():
         try:
             _preflight_listener(args)
-            _run_serve(args, ready=_emit_ready, stop_on_stdin_eof=True)
+            _run_serve(
+                args,
+                ready=_prepare_ready,
+                publish_ready=_emit_ready,
+                stop_on_stdin_eof=True,
+            )
         except KeyboardInterrupt:
             raise
         except SystemExit as exc:

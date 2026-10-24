@@ -175,12 +175,82 @@ def test_missing_huggingface_hub_is_clean_error(monkeypatch, capsys):
     assert events[-1]["event"] == "error" and events[-1]["code"] == "ModuleNotFoundError"
 
 
-def test_local_model_path_needs_no_download(fake_hub, tmp_path, monkeypatch, capsys):
+def _complete_local_model(path: Path) -> Path:
+    path.mkdir()
+    for name, data in _FILES.items():
+        (path / name).write_bytes(data)
+    return path
+
+
+@pytest.mark.parametrize("backend", ["mlx", "parakeet", "nemotron"])
+def test_complete_local_model_path_needs_no_download(
+    fake_hub, tmp_path, monkeypatch, capsys, backend
+):
     _cached, calls = fake_hub
+    model = _complete_local_model(tmp_path / backend)
     code, events, _ = _run(
-        monkeypatch, capsys, "--backend", "mlx", "--model", str(tmp_path), "--check", "--json"
+        monkeypatch, capsys, "--backend", backend, "--model", str(model), "--check", "--json"
     )
     assert code == 0 and events[-1]["cached"] is True and calls == []
+
+
+@pytest.mark.parametrize("state", ["missing", "incomplete"])
+@pytest.mark.parametrize("check", [True, False])
+def test_invalid_local_model_path_is_uncached_or_fetch_error(
+    fake_hub, tmp_path, monkeypatch, capsys, state, check
+):
+    _cached, calls = fake_hub
+    model = tmp_path / state
+    if state == "incomplete":
+        model.mkdir()
+        (model / "config.json").write_text("{}")
+    argv = ["--backend", "mlx", "--model", str(model), "--json"]
+    if check:
+        argv.append("--check")
+
+    code, events, _ = _run(monkeypatch, capsys, *argv)
+
+    if check:
+        assert code == 0
+        assert events[-1]["event"] == "summary"
+        assert events[-1]["cached"] is False
+    else:
+        assert code == 1
+        assert events[-1]["event"] == "error"
+        assert not any(event["event"] == "complete" for event in events)
+    assert calls == []
+
+
+@pytest.mark.parametrize("check", [True, False])
+def test_kyutai_rejects_local_model_paths(tmp_path, monkeypatch, capsys, check):
+    model = _complete_local_model(tmp_path / "kyutai")
+    argv = ["--backend", "kyutai", "--model", str(model), "--json"]
+    if check:
+        argv.append("--check")
+
+    code, events, _ = _run(monkeypatch, capsys, *argv)
+
+    assert code == 1
+    assert events[-1]["event"] == "error"
+    assert "local" in events[-1]["message"].lower()
+
+
+def test_local_model_uses_backend_required_patterns(tmp_path, monkeypatch, capsys):
+    model = tmp_path / "custom"
+    model.mkdir()
+    (model / "sentinel.bin").write_bytes(b"ok")
+    monkeypatch.setattr(
+        PF,
+        "specs_for",
+        lambda backend, selected: [PF.SnapshotSpec(selected, required=("sentinel.bin",))],
+    )
+
+    code, events, _ = _run(
+        monkeypatch, capsys, "--backend", "mlx", "--model", str(model), "--check", "--json"
+    )
+
+    assert code == 0
+    assert events[-1]["cached"] is True
 
 
 def test_human_check_output(fake_hub, monkeypatch, capsys):

@@ -19,12 +19,15 @@ import socket
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from stt_server import supervise
+from stt_server import __main__ as cli
 
 
 def _env(**extra: str) -> dict[str, str]:
@@ -82,6 +85,71 @@ def test_ready_line_then_stdin_eof_stops():
         _finish(proc)
 
 
+@pytest.mark.parametrize("stop_kind", ["stdin_eof", "sigterm"])
+def test_supervised_stop_during_blocked_warmup_exits_without_ready(stop_kind):
+    script = textwrap.dedent(
+        """
+        import asyncio
+        import os
+        import threading
+
+        from stt_server.backend import EchoBackend
+        from stt_server.server import TranscriptionServer, serve
+
+        async def start_without_listener(self):
+            return None
+
+        async def shutdown_without_listener(self):
+            return None
+
+        TranscriptionServer.start = start_without_listener
+        TranscriptionServer.shutdown = shutdown_without_listener
+
+        async def blocked_ready(server):
+            os.write(2, b"warmup-blocked\\n")
+            await asyncio.to_thread(threading.Event().wait)
+            os.write(1, b'{"event":"ready"}\\n')
+
+        asyncio.run(
+            serve(
+                EchoBackend(),
+                host="127.0.0.1",
+                port=0,
+                ready=blocked_ready,
+                stop_on_stdin_eof=True,
+            )
+        )
+        """
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_env(),
+    )
+    try:
+        assert proc.stderr is not None
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([proc.stderr], [], [], 0.25)
+            if ready and proc.stderr.readline() == b"warmup-blocked\n":
+                break
+        else:
+            raise AssertionError("warm-up did not block in time")
+
+        started = time.monotonic()
+        if stop_kind == "stdin_eof":
+            proc.stdin.close()
+        else:
+            proc.terminate()
+        assert proc.wait(timeout=3) == 0
+        assert time.monotonic() - started < 3
+        assert proc.stdout.read() == b""
+    finally:
+        _finish(proc)
+
+
 @pytest.fixture
 def short_home():
     """A private, short $HOME so the socket-dir ancestor walk passes and the
@@ -125,6 +193,91 @@ def test_live_unix_socket_reports_eaddrinuse(short_home):
             probe.connect(str(sock))
     finally:
         _finish(first)
+
+
+@pytest.mark.parametrize(
+    "probe_error",
+    [TimeoutError("timed out"), BlockingIOError(errno.EAGAIN, "backlog full")],
+)
+def test_unix_socket_ambiguous_probe_error_preserves_inode(short_home, monkeypatch, probe_error):
+    path = short_home / "listener.sock"
+    path.write_bytes(b"socket inode sentinel")
+    inode = path.stat().st_ino
+    real_is_socket = Path.is_socket
+    monkeypatch.setattr(Path, "is_socket", lambda self: self == path or real_is_socket(self))
+
+    class Probe:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def settimeout(self, _timeout):
+            pass
+
+        def connect(self, _path):
+            raise probe_error
+
+    monkeypatch.setattr(socket, "socket", lambda *_args, **_kwargs: Probe())
+    with pytest.raises(OSError) as exc:
+        cli._preflight_listener(SimpleNamespace(socket_path=str(path), host=None, port=None))
+
+    assert exc.value.errno == errno.EADDRINUSE
+    assert path.stat().st_ino == inode
+
+
+@pytest.mark.parametrize("stale_errno", [errno.ECONNREFUSED, errno.ENOENT])
+def test_unix_socket_narrow_stale_probe_errors_are_allowed(short_home, monkeypatch, stale_errno):
+    path = short_home / "listener.sock"
+    path.write_bytes(b"socket inode sentinel")
+    real_is_socket = Path.is_socket
+    monkeypatch.setattr(Path, "is_socket", lambda self: self == path or real_is_socket(self))
+
+    class Probe:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def settimeout(self, _timeout):
+            pass
+
+        def connect(self, _path):
+            raise OSError(stale_errno, "stale")
+
+    monkeypatch.setattr(socket, "socket", lambda *_args, **_kwargs: Probe())
+    cli._preflight_listener(SimpleNamespace(socket_path=str(path), host=None, port=None))
+
+
+@pytest.mark.parametrize("fatal_errno", [errno.EACCES, errno.EPERM, errno.EIO])
+def test_unix_socket_fatal_probe_error_preserves_inode(short_home, monkeypatch, fatal_errno):
+    path = short_home / "listener.sock"
+    path.write_bytes(b"socket inode sentinel")
+    inode = path.stat().st_ino
+    real_is_socket = Path.is_socket
+    monkeypatch.setattr(Path, "is_socket", lambda self: self == path or real_is_socket(self))
+
+    class Probe:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def settimeout(self, _timeout):
+            pass
+
+        def connect(self, _path):
+            raise OSError(fatal_errno, "fatal")
+
+    monkeypatch.setattr(socket, "socket", lambda *_args, **_kwargs: Probe())
+    with pytest.raises(OSError) as exc:
+        cli._preflight_listener(SimpleNamespace(socket_path=str(path), host=None, port=None))
+
+    assert exc.value.errno == fatal_errno
+    assert path.stat().st_ino == inode
 
 
 def test_busy_tcp_port_reports_eaddrinuse_fast():

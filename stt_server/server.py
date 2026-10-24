@@ -1068,6 +1068,7 @@ async def serve(
     auth_token: str | None = None,
     install_signal_handlers: bool = True,
     ready: Callable[[TranscriptionServer], Awaitable[None]] | None = None,
+    publish_ready: Callable[[TranscriptionServer], None] | None = None,
     stop_on_stdin_eof: bool = False,
 ) -> None:
     """Start the server, wait for shutdown signal, then drain and exit.
@@ -1075,11 +1076,13 @@ async def serve(
     Kept as the one public entrypoint intended for ``python -m stt_server``;
     tests drive ``TranscriptionServer`` directly.
 
-    ``stop_on_stdin_eof`` (``serve --supervised``) treats stdin EOF exactly like
-    SIGTERM once listening. If EOF arrives while the backend is still starting
-    (the supervisor quit mid-load), the process exits immediately: model loads
-    run in threads that cannot be cancelled, and Hugging Face downloads resume
-    from their ``.incomplete`` blobs next time.
+    ``ready`` performs asynchronous readiness preparation such as model warm-up;
+    ``publish_ready`` performs the final synchronous notification after a stop
+    check. ``stop_on_stdin_eof`` (``serve --supervised``) treats stdin EOF like
+    SIGTERM. If either arrives while startup or readiness preparation is pending,
+    the process exits immediately: model loads run in threads that cannot be
+    cancelled, and Hugging Face downloads resume from their ``.incomplete``
+    blobs next time.
     """
     cfg = ServerConfig(socket_path=socket_path, host=host, port=port, auth_token=auth_token)
     server = TranscriptionServer(backend or EchoBackend(), cfg)
@@ -1090,28 +1093,43 @@ async def serve(
         if not stop.done():
             stop.set_result(None)
 
-    if stop_on_stdin_eof:
-        from .supervise import watch_stdin_eof
+    def _hard_exit(stage: str) -> None:
+        logger.warning("stt_server: stop requested during %s; exiting", stage)
+        logging.shutdown()
+        os._exit(0)
 
-        watch_stdin_eof(loop, _request_stop)
-        start_task = asyncio.ensure_future(server.start())
-        await asyncio.wait({start_task, stop}, return_when=asyncio.FIRST_COMPLETED)
-        if not start_task.done():
-            logger.warning("stt_server: supervisor went away during startup; exiting")
-            logging.shutdown()
-            os._exit(0)
-        await start_task
-    else:
-        await server.start()
     if install_signal_handlers:
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
                 loop.add_signal_handler(sig, _request_stop)
             except NotImplementedError:
                 pass
-    if ready is not None:
-        await ready(server)
+    if stop_on_stdin_eof:
+        from .supervise import watch_stdin_eof
+
+        watch_stdin_eof(loop, _request_stop)
     try:
+        if stop_on_stdin_eof:
+            start_task = asyncio.ensure_future(server.start())
+            await asyncio.wait({start_task, stop}, return_when=asyncio.FIRST_COMPLETED)
+            if stop.done() and not start_task.done():
+                _hard_exit("startup")
+            await start_task
+        else:
+            await server.start()
+
+        if stop.done():
+            return
+        if ready is not None:
+            ready_task = asyncio.ensure_future(ready(server))
+            await asyncio.wait({ready_task, stop}, return_when=asyncio.FIRST_COMPLETED)
+            if stop.done() and not ready_task.done():
+                _hard_exit("readiness preparation")
+            await ready_task
+            if stop.done():
+                return
+        if publish_ready is not None:
+            publish_ready(server)
         await stop
     finally:
         await server.shutdown()
