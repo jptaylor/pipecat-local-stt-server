@@ -1046,6 +1046,46 @@ async def test_healthy_cli_shutdown_leaves_no_live_work(sock, monkeypatch):
     assert srv.state == "stopped" and not _lock_view(srv, sock)
 
 
+async def test_cancel_during_stop_wait_does_not_restart_it(sock, monkeypatch):
+    """Logic minor: a cancel of ``serve`` landing while a stop's bounded wait
+    on a stubborn readiness step ran made ``serve``'s ``finally`` wait a second
+    full drain timeout. The exit is bounded by ONE drain timeout."""
+    import functools
+    import os
+    import signal
+    import time
+
+    drain = 0.5
+    monkeypatch.setattr(
+        S, "ServerConfig", functools.partial(S.ServerConfig, drain_timeout_seconds=drain)
+    )
+    entered, gate = asyncio.Event(), asyncio.Event()
+
+    async def ready(server):
+        entered.set()
+        while not gate.is_set():
+            try:
+                await gate.wait()
+            except asyncio.CancelledError:
+                pass
+
+    serving = asyncio.ensure_future(S.serve(Gated(), socket_path=str(sock), ready=ready))
+    try:
+        await asyncio.wait_for(entered.wait(), T)
+        t0 = time.monotonic()
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.sleep(drain * 0.4)
+        serving.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(serving, T)
+        assert time.monotonic() - t0 < drain * 1.2
+    finally:
+        gate.set()
+        asyncio.get_running_loop().remove_signal_handler(signal.SIGTERM)
+        asyncio.get_running_loop().remove_signal_handler(signal.SIGINT)
+        await asyncio.sleep(0)
+
+
 @pytest.mark.parametrize("path", ["stop-during-step", "after-shutdown"])
 async def test_both_hard_exits_share_one_routine(monkeypatch, path):
     """The two hard exits are one routine with explicit parameters: a stop

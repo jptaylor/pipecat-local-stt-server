@@ -1986,7 +1986,8 @@ async def serve(
     that outlives that is handed to the server (``TranscriptionServer.adopt``):
     it keeps the lock until it ends (``live_work_count``; marked in
     ``stuck_work_count``). The readiness step is live work from creation
-    (``adopt(..., stuck=False)``). ``serve`` uses only the
+    (``adopt(..., stuck=False)``). A cancel of ``serve`` landing while that
+    bounded wait runs does not start a second one. ``serve`` uses only the
     server's public API, so an embedder can write the same loop.
     After ``shutdown()``, ``hard_exit_on_stop=True`` exits on any live work
     left (``live_work_count``), of any kind.
@@ -2029,6 +2030,10 @@ async def serve(
         cancellation cannot hold the exit). One still running may touch the
         backend: the server keeps it as live work, holding the lock until it
         ends, and logs its failure -- even if this wait is itself cancelled."""
+        # Settled from here on, whatever happens to this wait: a cancel of
+        # ``serve`` landing during it must not start a second full wait in
+        # ``serve``'s ``finally``.
+        pending.clear()
         task.cancel()
         try:
             await asyncio.wait({task}, timeout=cfg.drain_timeout_seconds)

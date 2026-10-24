@@ -193,7 +193,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a step as live work from creation, and `live_work_reasons` (new) names what
   is live. Which signal to read (`wait_stopped()` to wait; `live_work_count`
   only after `shutdown()`; `stuck_work_count` diagnostic) is documented once,
-  in the class docstring. Its two hard exits are one routine.
+  in the class docstring. Its two hard exits are one routine. A cancel of
+  `serve` landing during a stop's bounded wait on a startup / readiness step
+  no longer starts a second full drain-timeout wait.
 - `serve`: when `shutdown()` also fails after `serve` was already failing, the
   first failure is raised (and handed to `on_fatal`); the shutdown failure is
   logged instead of replacing it.
