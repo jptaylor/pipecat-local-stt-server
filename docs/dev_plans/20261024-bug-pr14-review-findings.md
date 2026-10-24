@@ -512,9 +512,41 @@ that did not fail closed. Fixed together:
   live work, not `stuck_work_count`; README "Adding a backend" step 1 defines
   `required`.
 
+### Round 9
+
+- **`adopt()` has a lifecycle precondition.** Root cause of all six
+  findings: round 8's public `adopt()` had no state rule and a serve-shaped
+  signature. Old invariant: "anything adopted is live work" (in `new` it made
+  `shutdown()` raise and left the server startable; in `stopped` it ran with
+  the lock released). New: "`adopt()` is valid only in `starting` /
+  `running` / `stopping`; in `new` / `stopped` it raises `RuntimeError` and
+  records nothing", so live work exists only where a lock is held.
+- **Caller-intent signature.** `adopt(task, *, abandoned=False,
+  label="step")`: the safe default is "you still await it"; `serve`'s
+  `_abandon_step` passes `abandoned=True` and the stage as `label`. Labels are
+  free-form (`live_work_reasons`: `"1 adopted: <label>"`); the closed `kind`
+  set is gone. An already-failed future adopted `abandoned=True` is logged
+  (the same `_log_leftover_failure` path as a pending one), not dropped.
+  Call sites swept: `serve` (readiness from creation, `_abandon_step`), tests,
+  CHANGELOG. `_abandon_step` skips `adopt` when the server is `new` /
+  `stopped`: only a startup task that never ran its first step can be pending
+  there (`start()` leaves those states synchronously).
+- **`wait_closed()`** is listed in the signal block as listener-only (not a
+  lock / stop signal); kept rather than aliased to `wait_stopped()`, the
+  smaller change that keeps its existing meaning.
+- Tests: the adopt matrix {new, starting, running, stopping, stopped} x
+  {pending, done-ok, done-failed, cancelled} x {abandoned} (40 cases:
+  refusal, ledger and stuck counts, failure log, lock held iff live work,
+  `shutdown()` and `wait_stopped()` after each). Mutation-checked: no
+  precondition (16 fail), `stopped` allowed (8), no done-failed log (3),
+  default `abandoned=True` (1). The supervised stop-during-warm-up test
+  stubbed `start()` to a no-op, leaving the server `new` while readiness ran
+  (unreachable with the real `start()`, and now refused); it uses the real
+  `start()` on TCP port 0.
+
 ## Final Results
 
 - All phases and follow-ups complete on `fix/pr14-review-findings`, including
-  the round-2 to round-8 fixes; Ruff format/check clean; full suite 593 passed, 3 skipped,
+  the round-2 to round-9 fixes; Ruff format/check clean; full suite 633 passed, 3 skipped,
   1 failed: the pre-existing, unrelated
   `tests/test_justfile_recipes.py::test_stt_list_prints_socket_in_tilde_form`.
