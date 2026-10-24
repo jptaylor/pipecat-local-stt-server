@@ -189,6 +189,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `serve`: when `shutdown()` also fails after `serve` was already failing, the
   first failure is raised (and handed to `on_fatal`); the shutdown failure is
   logged instead of replacing it.
+- `prefetch --model '~user/...'` for a user with no home directory is a missing
+  local model (`cached: false`, or `ModelInvalidError` on a fetch) instead of a
+  `BackendStartError` crash.
 - `prefetch --check` reports a malformed Hub repo id as `ConfigError` (exit 1),
   as a fetch does, instead of `cached: false`.
 - The `<socket>.lock` mode no longer depends on the umask (a `0777` umask made

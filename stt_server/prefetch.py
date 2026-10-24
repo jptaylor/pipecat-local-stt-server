@@ -123,7 +123,13 @@ def local_specs_for(backend: str, model: str) -> list[SnapshotSpec]:
     loaded = import_backend(backend)
     if not loaded.entry.local_model_paths:
         raise ConfigError(f"the {backend} backend does not support local model paths")
-    path = Path(model).expanduser()
+    try:
+        path = Path(model).expanduser()
+    except RuntimeError:
+        # ``~user/...`` for a user with no home directory: an explicit local
+        # reference that does not exist (``cached: false`` / ModelInvalidError),
+        # not a crash reported as BackendStartError.
+        path = Path(model)
     return [replace(spec, local_path=str(path)) for spec in _module_specs(loaded, model)]
 
 

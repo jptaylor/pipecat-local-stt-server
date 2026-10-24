@@ -574,6 +574,21 @@ def test_kyutai_glob_config_never_reads_as_cached(tmp_path, monkeypatch, capsys)
     assert code == 0 and events[-1]["cached"] is False
 
 
+@pytest.mark.parametrize("check", [True, False])
+def test_unexpandable_tilde_model_is_a_missing_local_model(monkeypatch, capsys, check):
+    """Codex medium: ``~nobody/x`` raised ``RuntimeError`` from ``expanduser``
+    and surfaced as BackendStartError instead of a missing local model."""
+    argv = ["--backend", "mlx", "--model", "~no_such_user_7f3a_r8/model", "--json"]
+    if check:
+        argv.append("--check")
+    code, events, _ = _run(monkeypatch, capsys, *argv)
+    if check:
+        assert code == 0 and events[-1]["event"] == "summary"
+        assert events[-1]["cached"] is False
+    else:
+        assert code == 1 and events[-1]["code"] == "ModelInvalidError"
+
+
 def test_kyutai_pipe_name_never_reads_as_cached(tmp_path, monkeypatch, capsys):
     """Round 8: ``|`` used to be an in-band alternatives delimiter, so a config
     naming ``model.q8.safetensors|config.json`` passed completeness on
