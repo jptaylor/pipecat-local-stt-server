@@ -45,7 +45,7 @@ from websockets.asyncio.server import (
 
 from . import protocol as P
 from ._peercred import peer_uid
-from .backend import BackendStream, EchoBackend, TranscriptionBackend
+from .backend import BackendStream, EchoBackend, TranscriptionBackend, abort_backend
 
 # OpenAI Realtime groups errors into a coarse "type" field (e.g.
 # invalid_request_error, server_error, authentication_error) alongside the
@@ -207,6 +207,18 @@ def _lock_path(socket_path: str | os.PathLike) -> str:
     return f"{socket_path}.lock"
 
 
+# After the drain timeout, how long cancelled session tasks get to unwind
+# before shutdown proceeds regardless.
+_CANCEL_GRACE_SECONDS = 2.0
+
+# How long ``acquire_socket_lock`` retries a contended lock before reporting
+# EADDRINUSE. A live server holds it for its whole lifetime; a preflight probe
+# (``socket_lock_held``) holds it for microseconds, and must not make a
+# concurrent real starter fail.
+_LOCK_RETRY_SECONDS = 0.25
+_LOCK_RETRY_INTERVAL = 0.01
+
+
 def acquire_socket_lock(socket_path: str | os.PathLike) -> int:
     """Take the single-server lock for ``socket_path``; return the held fd.
 
@@ -215,8 +227,11 @@ def acquire_socket_lock(socket_path: str | os.PathLike) -> int:
     decided by an ``flock`` on ``<socket>.lock`` instead. The kernel drops the
     lock when the owning process dies, so it can never go stale; clients never
     touch it, so any number of them share one server. The lock file is left in
-    place on exit (unlinking it would race a concurrent starter). Raises
-    ``OSError(EADDRINUSE)`` when another process holds it.
+    place on exit (unlinking it would race a concurrent starter). It is created
+    0600; a pre-existing one we own with group/other bits is tightened to 0600
+    (another uid able to open it could hold the lock and block every future
+    server), and one we do not own is refused. Raises ``OSError(EADDRINUSE)``
+    when another process holds it for longer than a brief probe would.
     """
     import errno
     import fcntl
@@ -227,14 +242,21 @@ def acquire_socket_lock(socket_path: str | os.PathLike) -> int:
         st = os.fstat(fd)
         if not _stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
             raise OSError(errno.EACCES, f"{path} is not a regular file owned by this user")
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            if exc.errno in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
-                raise OSError(
-                    errno.EADDRINUSE, f"a server is already running for {socket_path}"
-                ) from exc
-            raise
+        if st.st_mode & 0o077:
+            os.fchmod(fd, 0o600)
+        deadline = time.monotonic() + _LOCK_RETRY_SECONDS
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+                    raise
+                if time.monotonic() >= deadline:
+                    raise OSError(
+                        errno.EADDRINUSE, f"a server is already running for {socket_path}"
+                    ) from exc
+                time.sleep(_LOCK_RETRY_INTERVAL)
     except BaseException:
         os.close(fd)
         raise
@@ -246,18 +268,22 @@ def socket_lock_held(socket_path: str | os.PathLike) -> bool:
 
     Read-only probe for preflight: never creates the lock file, never follows a
     symlink, and treats anything that is not a plain owned file as "not held"
-    (``start()`` will report it properly when it tries to acquire).
+    (``start()`` will report it properly when it tries to acquire). Probes with
+    a *shared* lock: that conflicts with a server's exclusive lock (so a live
+    server reads as held) but not with another probe. A shared lock still
+    conflicts with a concurrent starter's exclusive one, so the probe holds it
+    only for an instant and ``acquire_socket_lock`` retries briefly.
     """
     import errno
     import fcntl
 
     try:
-        fd = os.open(_lock_path(socket_path), os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+        fd = os.open(_lock_path(socket_path), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError:
         return False
     try:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except OSError as exc:
             return exc.errno in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK)
         fcntl.flock(fd, fcntl.LOCK_UN)
@@ -328,6 +354,18 @@ class TranscriptionServer:
     async def start(self) -> None:
         if self._started:
             return
+        try:
+            await self._start_unlocked()
+        except BaseException:
+            # A server that never started is never ``close()``d, so release the
+            # lock and run the backend's cheap ``abort()`` hook here (parakeet /
+            # nemotron would otherwise leak their private temp dir on every
+            # failed start, e.g. a launchd crash-loop against a held lock).
+            self._release_socket_lock()
+            abort_backend(self._backend, logger)
+            raise
+
+    async def _start_unlocked(self) -> None:
         verified_socket: Path | None = None
         if self._config.socket_path:
             socket_path = Path(self._config.socket_path)
@@ -347,11 +385,7 @@ class TranscriptionServer:
             # in milliseconds instead of after a multi-GB load, and the socket
             # file below is only ever replaced by the lock holder.
             self._socket_lock_fd = acquire_socket_lock(verified_socket)
-        try:
-            await self._start_locked(verified_socket)
-        except BaseException:
-            self._release_socket_lock()
-            raise
+        await self._start_locked(verified_socket)
 
     def _release_socket_lock(self) -> None:
         fd, self._socket_lock_fd = self._socket_lock_fd, None
@@ -454,6 +488,11 @@ class TranscriptionServer:
         (never a socket someone else created at the same path), and calls the
         backend's optional ``abort()`` hook (cheap, non-blocking: e.g. removing
         a private temp dir -- no thread joins, no Metal drain).
+
+        The single-server lock is deliberately NOT released: the caller is about
+        to ``os._exit``, and the kernel drops the lock with the process. Releasing
+        it here would let a new server acquire it and start loading while this
+        process (and its model-load thread) still exists.
         """
         bound = self._bound_socket_id
         if bound is not None and self._config.socket_path:
@@ -464,13 +503,7 @@ class TranscriptionServer:
                     os.unlink(path)
             except OSError:
                 pass
-        self._release_socket_lock()
-        abort = getattr(self._backend, "abort", None)
-        if callable(abort):
-            try:
-                abort()
-            except Exception:  # noqa: BLE001 -- best-effort on the way out
-                logger.exception("stt_server: backend abort failed")
+        abort_backend(self._backend, logger)
 
     async def shutdown(self) -> None:
         """Stop accepting new connections and drain active sessions.
@@ -492,6 +525,16 @@ class TranscriptionServer:
                 await asyncio.sleep(0)
             return
         self._shutdown_event.set()
+        try:
+            await self._drain_and_close()
+        finally:
+            # Even when the drain or ``backend.close()`` raises (or this task is
+            # cancelled), release the single-server lock and mark the server
+            # stopped: a concurrent second ``shutdown()`` spins on ``_started``.
+            self._release_socket_lock()
+            self._started = False
+
+    async def _drain_and_close(self) -> None:
         if self._server is not None:
             # ``close_connections=True`` sends a close frame to every open
             # socket so handler recv loops exit instead of blocking forever
@@ -499,27 +542,41 @@ class TranscriptionServer:
             self._server.close(close_connections=True)
         pending = list(self._active_handlers | self._active_decodes)
         if pending:
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*pending, return_exceptions=True),
-                    timeout=self._config.drain_timeout_seconds,
-                )
-            except asyncio.TimeoutError:
+            # ``asyncio.wait`` (not ``wait_for(gather(...))``): ``wait_for``
+            # waits for the cancelled gather to finish unwinding, so a task
+            # that delays or swallows cancellation (the session handlers catch
+            # ``CancelledError`` around in-flight decodes and then send/close)
+            # would hold shutdown with no bound.
+            _done, still = await asyncio.wait(pending, timeout=self._config.drain_timeout_seconds)
+            if still:
                 logger.warning(
-                    "stt_server: drain timeout expired with %d tasks in flight",
-                    sum(1 for t in pending if not t.done()),
+                    "stt_server: drain timeout expired with %d tasks in flight", len(still)
                 )
-                for t in pending:
-                    if not t.done():
-                        t.cancel()
-                # Give the cancellations a short window to unwind before
-                # backend.close() touches shared MLX/Metal state.
-                await asyncio.gather(*pending, return_exceptions=True)
+                for t in still:
+                    t.cancel()
+                # Give the cancellations a short, bounded window to unwind
+                # before backend.close() touches shared MLX/Metal state.
+                _done, stuck = await asyncio.wait(still, timeout=_CANCEL_GRACE_SECONDS)
+                if stuck:
+                    logger.warning(
+                        "stt_server: %d tasks did not unwind within %.1fs of cancel; "
+                        "closing anyway",
+                        len(stuck),
+                        _CANCEL_GRACE_SECONDS,
+                    )
+        for t in pending:
+            # Retrieve outcomes, as ``gather(return_exceptions=True)`` did, so a
+            # failed task is not reported as "exception never retrieved".
+            if t.done() and not t.cancelled():
+                t.exception()
         if self._server is not None:
-            await self._server.wait_closed()
+            # ``wait_closed`` also waits for connection handlers; bound it the
+            # same way so a stuck handler cannot hold shutdown.
+            closer = asyncio.ensure_future(self._server.wait_closed())
+            _done, stuck = await asyncio.wait({closer}, timeout=_CANCEL_GRACE_SECONDS)
+            if stuck:
+                closer.cancel()
         await self._backend.close()
-        self._release_socket_lock()
-        self._started = False
 
     # --- connection handling ---
     async def _process_request(self, connection, request):
@@ -1194,21 +1251,37 @@ async def serve(
     ready: Callable[[TranscriptionServer], Awaitable[None]] | None = None,
     publish_ready: Callable[[TranscriptionServer], None] | None = None,
     stop_on_stdin_eof: bool = False,
+    hard_exit_on_stop: bool = False,
 ) -> None:
     """Start the server, wait for shutdown signal, then drain and exit.
 
-    Kept as the one public entrypoint intended for ``python -m stt_server``;
-    tests drive ``TranscriptionServer`` directly.
+    The public entrypoint behind ``python -m stt_server``; tests drive
+    ``TranscriptionServer`` directly.
 
     ``ready`` performs asynchronous readiness preparation such as model warm-up;
     ``publish_ready`` performs the final synchronous notification after a stop
     check. ``stop_on_stdin_eof`` (``serve --supervised``) treats stdin EOF like
-    SIGTERM. If either arrives while startup or readiness preparation is pending,
-    the process exits immediately: model loads run in threads that cannot be
-    cancelled, and Hugging Face downloads resume from their ``.incomplete``
-    blobs next time.
+    SIGTERM.
+
+    A stop (signal, or stdin EOF) that arrives while startup or readiness
+    preparation is pending:
+
+    - ``hard_exit_on_stop=False`` (default, for in-process callers): the pending
+      step is cancelled and ``serve`` returns after the normal ``shutdown()``.
+      A model load already running in a worker thread keeps running until it
+      finishes (threads cannot be cancelled); the process is the caller's.
+    - ``hard_exit_on_stop=True`` (the CLI, which owns its process): best-effort
+      cleanup (``abort_sync``) and an immediate ``os._exit(0)``, so SIGTERM
+      during a multi-GB load is honoured at once. Hugging Face downloads resume
+      from their ``.incomplete`` blobs next time.
     """
-    cfg = ServerConfig(socket_path=socket_path, host=host, port=port, auth_token=auth_token)
+    try:
+        cfg = ServerConfig(socket_path=socket_path, host=host, port=port, auth_token=auth_token)
+    except BaseException:
+        # No server will ever ``start()``/``close()`` this backend.
+        if backend is not None:
+            abort_backend(backend, logger)
+        raise
     server = TranscriptionServer(backend or EchoBackend(), cfg)
     loop = asyncio.get_running_loop()
     stop = loop.create_future()
@@ -1222,6 +1295,24 @@ async def serve(
         server.abort_sync()
         logging.shutdown()
         os._exit(0)
+
+    async def _run_until_stop(coro: Awaitable[None], stage: str) -> bool:
+        """Await ``coro`` unless a stop arrives first; True when it completed
+        and no stop is pending."""
+        task = asyncio.ensure_future(coro)
+        await asyncio.wait({task, stop}, return_when=asyncio.FIRST_COMPLETED)
+        if stop.done() and not task.done():
+            if hard_exit_on_stop:
+                _hard_exit(stage)
+            logger.info("stt_server: stop requested during %s; cancelling it", stage)
+            task.cancel()
+            # Bounded: a step that swallows cancellation cannot hold the stop.
+            await asyncio.wait({task}, timeout=cfg.drain_timeout_seconds)
+            if task.done() and not task.cancelled():
+                task.exception()  # retrieved; we are stopping regardless
+            return False
+        await task
+        return not stop.done()
 
     if install_signal_handlers:
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -1238,22 +1329,10 @@ async def serve(
         # installed before ``start()``, so awaiting it bare would defer a
         # SIGTERM/SIGINT until the backend import finished (``main`` installed
         # them after ``start()``, leaving the default terminate-now action).
-        start_task = asyncio.ensure_future(server.start())
-        await asyncio.wait({start_task, stop}, return_when=asyncio.FIRST_COMPLETED)
-        if stop.done() and not start_task.done():
-            _hard_exit("startup")
-        await start_task
-
-        if stop.done():
+        if not await _run_until_stop(server.start(), "startup"):
             return
-        if ready is not None:
-            ready_task = asyncio.ensure_future(ready(server))
-            await asyncio.wait({ready_task, stop}, return_when=asyncio.FIRST_COMPLETED)
-            if stop.done() and not ready_task.done():
-                _hard_exit("readiness preparation")
-            await ready_task
-            if stop.done():
-                return
+        if ready is not None and not await _run_until_stop(ready(server), "readiness preparation"):
+            return
         if publish_ready is not None:
             publish_ready(server)
         await stop

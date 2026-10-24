@@ -11,8 +11,9 @@ decode, ``events()`` may yield a single large ``delta`` followed by
 
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
-from typing import AsyncGenerator, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 
 @dataclass
@@ -47,6 +48,37 @@ class TranscriptionBackend(Protocol):
     async def start(self) -> None: ...
     async def open_stream(self, *, language: str | None = None) -> BackendStream: ...
     async def close(self) -> None: ...
+
+
+# Optional backend hooks. Neither is part of ``TranscriptionBackend`` (a backend
+# need not implement them), but both are fixed contracts:
+#
+# - ``abort()`` (instance method, :class:`AbortableBackend`): synchronous, cheap,
+#   non-blocking cleanup -- no thread joins, no Metal drain -- e.g. removing a
+#   private temp dir. ``TranscriptionServer`` calls it when ``start()`` fails
+#   (``close()`` never runs for a server that never started) and from
+#   ``abort_sync()`` before a hard process exit. It may run before ``start()``
+#   and more than once, so it must be idempotent. ``close()`` may call it too.
+# - ``prefetch_specs(model: str | None) -> list[SnapshotSpec]`` (module-level
+#   function in the backend's module, registered in ``backends.BACKENDS``): the
+#   Hugging Face snapshots ``python -m stt_server prefetch`` fetches/checks so
+#   the backend can start ``model`` (``None`` = its default) offline. See
+#   ``stt_server.snapshot.SnapshotSpec``.
+
+
+@runtime_checkable
+class AbortableBackend(Protocol):
+    def abort(self) -> None: ...
+
+
+def abort_backend(backend: object, log) -> None:
+    """Call ``backend.abort()`` if it implements the optional hook; log failures."""
+    abort = getattr(backend, "abort", None)
+    if callable(abort):
+        try:
+            abort()
+        except Exception:  # noqa: BLE001 -- best-effort cleanup
+            log.exception("stt_server: backend abort failed")
 
 
 # ---------------------------------------------------------------------------
