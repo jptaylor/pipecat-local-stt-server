@@ -19,8 +19,11 @@ cancelled task. Invariants under test:
    may be retried, from a clean attempt (every per-attempt slot reset).
 4. A started backend is closed on every exit from ``start()`` short of running;
    every wait on foreign code is bounded, and what outlives it stays in the one
-   live-work ledger, marked stuck: ``stuck_work_count`` and the lock are views
-   of the same ledger. ``wait_stopped()`` is the public "lock is free" wait.
+   live-work ledger, marked stuck (a diagnostic). The lock and the CLI's hard
+   exit both read the whole ledger (``live_work_count``), and an entry whose
+   cleanup raised stays in it: fail closed. Every exit from ``serve`` settles
+   a pending startup / readiness step the same way. ``wait_stopped()`` is the
+   public "lock is free" wait.
 
 Every wait is an event or a bounded ``asyncio.wait_for``: no sleeps decide an
 outcome, so a regression fails instead of hanging.
@@ -567,6 +570,98 @@ async def test_orphan_bind_keeps_the_lock_until_its_cleanup_ran(sock, monkeypatc
     assert srv.state == "stopped" and not _lock_view(srv, sock)
 
 
+async def _not_stopped_within(srv: TranscriptionServer, seconds: float) -> bool:
+    try:
+        await asyncio.wait_for(asyncio.shield(srv.wait_stopped()), seconds)
+    except TimeoutError:
+        return True
+    return False
+
+
+async def test_a_failing_orphan_cleanup_keeps_the_lock(sock, monkeypatch, caplog):
+    """Codex high: ``_retire`` dropped the entry in a ``finally`` even when its
+    cleanup raised. An orphan bind whose ``listener.close()`` failed left the
+    listener serving, the ledger empty, and the lock released. Fail closed:
+    the bind stays live (stuck), the lock stays held, ``wait_stopped`` waits."""
+
+    async def nothing(listener):
+        return None
+
+    gate, bound, listeners = _slow_tail_bind(monkeypatch, nothing)
+    srv = _server(Gated(), sock)
+    cleaned = asyncio.Event()
+    real_cleanup = srv._close_orphan_listener
+
+    def cleanup(task):
+        try:
+            real_cleanup(task)
+        finally:
+            cleaned.set()
+
+    srv._close_orphan_listener = cleanup
+    task = asyncio.ensure_future(srv.start())
+    await asyncio.wait_for(bound.wait(), T)
+    task.cancel()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    task.cancel()  # second cancel: the bind is orphaned
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, T)
+    (listener,) = listeners
+    real_close = listener.close
+
+    def broken_close(**kw):
+        raise OSError("close failed")
+
+    listener.close = broken_close
+    try:
+        gate.set()
+        await asyncio.wait_for(cleaned.wait(), T)
+        assert listener.is_serving()  # the work the lock protects is still there
+        assert srv.state == "stopping" and _lock_view(srv, sock)
+        assert srv.live_work_count >= 1 and srv.stuck_work_count >= 1
+        assert "1 listener bind" in srv._live_reasons()
+        assert await _not_stopped_within(srv, 0.05)
+        assert "cleanup of a finished listener bind failed" in caplog.text
+    finally:
+        real_close(close_connections=True)
+        await listener.wait_closed()
+        srv._live_work.clear()
+        srv._settle()
+    assert srv.state == "stopped" and not _lock_view(srv, sock)
+
+
+async def test_a_then_for_a_done_future_runs_now_and_fails_closed(sock, caplog):
+    """Architecture minor: ``_track`` silently dropped a ``then`` given for an
+    already-done future, so its cleanup (registering successor work) never
+    ran. It runs at once, through ``_retire``; a failing one fails closed."""
+    srv = _server(Gated(), sock)
+    await srv.start()
+    loop = asyncio.get_running_loop()
+    done, failed = loop.create_future(), loop.create_future()
+    done.set_result(None)
+    failed.set_result(None)
+    ran = []
+    srv._track(done, "bind", then=ran.append)
+    assert ran == [done] and done not in srv._live_work
+
+    def boom(fut):
+        raise RuntimeError("cleanup failed")
+
+    srv._track(failed, "bind", then=boom)
+    assert srv._live_work[failed].stuck
+    try:
+        await asyncio.wait_for(srv.shutdown(), T)
+        # The entry whose cleanup failed holds the lock past the drain.
+        assert srv.state == "stopping" and _lock_view(srv, sock)
+        assert srv._live_reasons() == ["1 listener bind"] and srv.live_work_count == 1
+        assert "cleanup of a finished listener bind failed" in caplog.text
+    finally:
+        srv._live_work.clear()
+        srv._settle()
+    assert srv.state == "stopped" and not _lock_view(srv, sock)
+
+
 async def test_every_server_task_is_live_work_until_it_completes(sock):
     """Codex medium: the listener's ``wait_closed`` task (and before it, the
     normal bind task) was created outside the ledger, so the lock could be
@@ -768,6 +863,144 @@ async def test_soft_stop_keeps_an_uncancellable_readiness_step(sock, monkeypatch
         asyncio.get_running_loop().remove_signal_handler(signal.SIGINT)
 
 
+@pytest.mark.parametrize("stage", ["startup", "readiness"])
+@pytest.mark.parametrize("trigger", ["cancel", "stop"])
+@pytest.mark.parametrize("step", ["prompt", "stubborn"])
+async def test_every_serve_exit_settles_a_pending_step(sock, monkeypatch, stage, trigger, step):
+    """Codex high: cancelling ``serve`` itself (not a stop) left the startup /
+    readiness task running, unawaited and outside the ledger; ``shutdown()``
+    then closed the backend under it and released the lock. Every exit
+    (stop or cancel) x step (finishes promptly when cancelled, or ignores it)
+    must cancel the step, wait for it (bounded), and keep one that outlives
+    that as live work holding the lock."""
+    import functools
+    import os
+    import signal
+
+    monkeypatch.setattr(
+        S, "ServerConfig", functools.partial(S.ServerConfig, drain_timeout_seconds=0.05)
+    )
+    servers: list[TranscriptionServer] = []
+
+    class Capture(TranscriptionServer):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            servers.append(self)
+
+    monkeypatch.setattr(S, "TranscriptionServer", Capture)
+    entered, gate, tasks = asyncio.Event(), asyncio.Event(), []
+
+    async def pending_step():
+        tasks.append(asyncio.current_task())
+        entered.set()
+        while not gate.is_set():
+            try:
+                await gate.wait()
+            except asyncio.CancelledError:
+                if step == "prompt":
+                    raise
+
+    class Backend(Gated):
+        async def start(self):
+            if stage == "startup":
+                await pending_step()
+
+    async def ready(server):
+        await pending_step()
+
+    serving = asyncio.ensure_future(
+        S.serve(
+            Backend(),
+            socket_path=str(sock),
+            ready=ready if stage == "readiness" else None,
+            install_signal_handlers=trigger == "stop",
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), T)
+        if trigger == "stop":
+            os.kill(os.getpid(), signal.SIGTERM)
+            await asyncio.wait_for(serving, T)
+        else:
+            serving.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(serving, T)
+        (srv,) = servers
+        (t,) = tasks
+        if step == "prompt":
+            assert t.done(), "the pending step must be cancelled and awaited"
+            assert srv.state == "stopped" and not _lock_view(srv, sock)
+            assert srv.live_work_count == 0
+        else:
+            assert not t.done()
+            assert srv.state == "stopping" and _lock_view(srv, sock)
+            assert srv.live_work_count >= 1 and srv.stuck_work_count >= 1
+            assert await _not_stopped_within(srv, 0.05)
+            gate.set()
+            await asyncio.wait_for(srv.wait_stopped(), T)
+            assert not _lock_view(srv, sock)
+    finally:
+        gate.set()
+        if trigger == "stop":
+            asyncio.get_running_loop().remove_signal_handler(signal.SIGTERM)
+            asyncio.get_running_loop().remove_signal_handler(signal.SIGINT)
+        await asyncio.wait(tasks or {serving}, timeout=T)
+
+
+async def test_serve_failure_during_readiness_leaves_no_live_work(sock):
+    """The third exit: the readiness step itself fails. It is done, so nothing
+    is pending; the drain releases the lock."""
+    seen = []
+
+    async def ready(server):
+        seen.append(server)
+        raise ValueError("warm-up failed")
+
+    with pytest.raises(ValueError, match="warm-up failed"):
+        await asyncio.wait_for(
+            S.serve(Gated(), socket_path=str(sock), install_signal_handlers=False, ready=ready), T
+        )
+    (srv,) = seen
+    assert srv.state == "stopped" and srv.live_work_count == 0 and not _lock_view(srv, sock)
+
+
+async def test_hard_exit_fires_on_any_live_entry_kind(monkeypatch):
+    """Architecture minor: the hard exit read ``stuck_work_count``, kept equal
+    to "lock held" by a sweep that skipped non-future entries, so a leftover
+    non-future entry (here a step token that never ended) held the lock while
+    the CLI did not exit. The exit now reads the whole ledger."""
+
+    class Exited(BaseException):
+        pass
+
+    def fake_exit(code):
+        raise Exited(code)
+
+    monkeypatch.setattr(S.os, "_exit", fake_exit)
+    seen = []
+
+    async def ready(server):
+        seen.append(server)
+        server._begin_work()  # a non-future entry left behind
+        raise ValueError("warm-up failed")
+
+    with pytest.raises(Exited) as info:
+        await asyncio.wait_for(
+            S.serve(
+                Gated(),
+                host="127.0.0.1",
+                port=0,
+                install_signal_handlers=False,
+                ready=ready,
+                hard_exit_on_stop=True,
+            ),
+            T,
+        )
+    assert info.value.args == (1,)
+    (srv,) = seen
+    assert srv.stuck_work_count == 0 and srv.live_work_count == 1
+
+
 async def test_serve_rejects_on_fatal_without_hard_exit():
     b = Gated()
     with pytest.raises(S.ConfigError, match="hard_exit_on_stop"):
@@ -938,7 +1171,7 @@ async def test_matrix_shutdown(sock, state):
 # --- the CLI's stuck-work hard exit must not swallow a failure ------------------
 
 
-def test_cli_stuck_task_exit_still_reports_the_failure():
+def test_cli_stuck_work_exit_still_reports_the_failure():
     """``serve(hard_exit_on_stop=True)`` ``os._exit``s when a session task
     outlives shutdown, skipping ``_cmd_serve``'s handlers: a failing
     ``backend.close()`` must still reach stderr and the supervised ``error``
