@@ -235,8 +235,10 @@ repo id only and rejects local paths.
 
 ```bash
 uv run python -m stt_server prefetch --backend parakeet --model ~/models/parakeet --check
-``` `--check` exits 0 whenever the probe ran; the
-answer is the `cached` field. With `--json` each stdout line is one event:
+```
+
+`--check` exits 0 whenever the probe ran; the answer is the `cached` field. With
+`--json` each stdout line is one event:
 
 | Event | Fields |
 |---|---|
@@ -254,9 +256,10 @@ answer is the `cached` field. With `--json` each stdout line is one event:
 `progress` before `done` has `downloaded_bytes == total_bytes` and
 `files_done == files_total` (all zero when everything was cached).
 
-The schema matches `tts_server prefetch` in
+The event schema matches `tts_server prefetch` in
 [pipecat-local-tts-server](https://github.com/vr000m/pipecat-local-tts-server),
-so one supervisor can drive both.
+so one supervisor can drive both. The `error` codes are per repo; see
+[Error codes](#error-codes-per-repo) below.
 
 ## Supervised mode
 
@@ -268,11 +271,7 @@ menu bar app. Logging on stderr is unchanged. In addition:
   `{"event":"ready","backend","model","host","port","socket_path","rate","pid"}`
   line. With `--port 0`, `port` is the real port.
 - **A fatal error prints `{"event":"error","code","message","exc_type"}`** and
-  exits 1. Codes: `EADDRINUSE` (a busy port, or a Unix socket a live server
-  already owns, reported before the model loads), `EACCES`,
-  `ModuleNotFoundError` (backend extra missing), `ModelDownloadError`,
-  `ModelInvalidError` (the cached or local model is incomplete or unreadable),
-  `ConfigError`, `BackendStartError`.
+  exits 1. See [Error codes](#error-codes-per-repo) for the `code` values.
 - **stdin EOF stops the server** exactly like SIGTERM. The parent keeps a pipe
   open, so the server exits when the parent closes it or dies. During startup
   the process exits at once; interrupted downloads resume next time. (Embedding
@@ -286,6 +285,55 @@ menu bar app. Logging on stderr is unchanged. In addition:
 
 Skip any stdout line that does not parse as JSON: native code writing straight
 to file descriptor 1 can bypass the redirect.
+
+### Error codes (per repo)
+
+The `error` event's `code` (from `serve --supervised` and `prefetch --json`) is
+a stable string. The lifecycle channel has the same shape as `tts_server`'s,
+but each repo has its own code list:
+
+| Code | This repo (STT) | When |
+|---|---|---|
+| `EADDRINUSE` | yes | a busy port, or a Unix socket a live server already owns (checked before the model loads) |
+| `EACCES` | yes | permission denied (including an unopenable `<socket>.lock`) |
+| `ModuleNotFoundError` | yes | the backend's extra is not installed |
+| `ModelDownloadError` | yes | a model fetch failed (network library error, or a network error during a fetch) |
+| `ModelInvalidError` | yes (STT only) | the cached or local model is incomplete or unreadable (missing files, a `config.json` that does not parse or name its files) |
+| `ConfigError` | yes | a rejected endpoint or CLI input: non-loopback host, missing endpoint, an untrusted socket directory, a malformed Hub repo id, an unsupported local model path |
+| `BackendStartError` | yes | anything else |
+
+`pipecat-local-tts-server` has no `ModelInvalidError` and adds
+`SocketPathConflict`; check its README for its list. **A supervisor driving
+both should treat any code it does not recognise as `BackendStartError`.**
+
+## Adding a backend
+
+A backend is registered in one place and picked up by `--backend`, the
+`--model` default and `prefetch`. Checklist:
+
+1. **Module** `stt_server/backends/<name>.py`: a class implementing
+   `TranscriptionBackend` (`backend_name`, `model`, `start()`, `open_stream()`,
+   `close()`) and a module-level `prefetch_specs(model) -> list[SnapshotSpec]`
+   (`stt_server.snapshot`). Import the optional extra only inside `start()` or
+   the lazy model load, never at module load, and re-raise a missing extra as
+   `ModuleNotFoundError` with the `uv sync --extra <name> --inexact` hint. Reuse
+   `DecodeGuardMixin` (`backends/_thread_util.py`) for MLX/Metal decodes.
+2. **Error origin**: wrap only the fetch-and-load call in
+   `snapshot.download_phase()` (never a decode) and tag an unusable fetched
+   snapshot with `snapshot.mark_model_invalid()`.
+3. **Optional `abort()`** if the backend owns cleanup that must survive a failed
+   start or a hard exit (e.g. a private temp dir): synchronous, idempotent, safe
+   while a decode thread still runs, and undone by the next `start()`. The full
+   contract is in `stt_server/backend.py`.
+4. **Registry**: a `BackendEntry` in `stt_server/backends/__init__.py`
+   `BACKENDS` (module, class name, default model, `local_model_paths`).
+5. **Packaging**: an extra in `pyproject.toml` (plus a `[tool.uv]` `conflicts`
+   entry if its pins clash with the other MLX extras) and a CI job in
+   `.github/workflows/test.yml` if it needs its own environment.
+6. **Tests**: `tests/test_backend_registry.py` covers every registry entry; add a
+   `tests/test_<name>_backend.py` with fake modules for the stream contract.
+7. **Docs**: the backend table above, [`docs/operations.md`](docs/operations.md)
+   (`--backend` list; socket table if it gets a LaunchAgent), and `CHANGELOG.md`.
 
 ## Documentation
 

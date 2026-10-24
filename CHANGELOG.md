@@ -21,23 +21,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   starter retries a contended lock for 250 ms, so a probe never makes a
   concurrent real start fail.
 - `ModelInvalidError` supervised/prefetch error code: the model snapshot is
-  present but unusable (incomplete, corrupt or incomplete `config.json`). Existing
-  codes are unchanged.
+  present but unusable (incomplete, corrupt or incomplete `config.json`, an
+  incomplete local model directory), from `prefetch` and from the `kyutai`
+  loader in `serve`. `ConfigError` now covers only explicit configuration
+  rejections (`supervise.ConfigError`, a `ValueError` subclass: endpoint,
+  socket directory, malformed Hub repo id, unsupported local model path); a
+  bare `ValueError` from a model library is `BackendStartError`. The code list
+  is per repo (`tts_server` has `SocketPathConflict` and no
+  `ModelInvalidError`); supervisors should treat an unknown code as
+  `BackendStartError`. See README "Error codes (per repo)".
 - `serve(..., hard_exit_on_stop=False)`: a stop during startup/warm-up now
-  cancels the pending step and shuts down normally for in-process callers; the
-  CLI passes `True` to keep the immediate exit.
+  cancels the pending step (waiting at most the drain timeout) and shuts down
+  normally for in-process callers; the CLI passes `True` to keep the immediate
+  exit. **Behaviour change for in-process callers**, which previously got the
+  immediate `os._exit`.
 - `backends.BACKENDS` registry: CLI choices, `--model` defaults, construction and
   the prefetch module map derive from one table. `SnapshotSpec` moved to the
   stdlib-only `stt_server.snapshot` (still importable from `stt_server.prefetch`);
-  the optional backend `abort()` hook and module-level `prefetch_specs()` are
-  documented in `stt_server/backend.py`.
-
+  the optional backend `abort()` hook (`AbortableBackend`, now exported) and
+  module-level `prefetch_specs()` are documented in `stt_server/backend.py`;
+  `backends.import_backend()` is the one lookup-and-import; `--model` defaults
+  come only from the registry. README has an "Adding a backend" checklist.
 - **`serve --supervised`** for a managing parent process: stdout carries only
   JSON lines (`ready` once listening and warm, with the real port; or `error`
   with a stable `code` such as `EADDRINUSE`, `ModuleNotFoundError`,
   `ModelDownloadError`), a busy port or live socket is reported before the
-  model loads, and stdin EOF stops the server like SIGTERM. Same contract as
-  `tts_server serve --supervised`.
+  model loads, and stdin EOF stops the server like SIGTERM. Same channel as
+  `tts_server serve --supervised`; the `code` list is per repo (see above).
 - **`prefetch` subcommand**: downloads what a backend loads (with JSON-lines
   byte progress under `--json`), and `--check` reports whether the weights are
   cached without touching the network. Each backend module exports
@@ -78,7 +88,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bare `ConnectionError`/`TimeoutError` is a download failure only when raised by
   a backend's model fetch-and-load call or a `prefetch` download, or when a
   network library raised it (a decode during warm-up is not a download). A
-  `prefetch` failure where nothing network-related failed is `ModelInvalidError`.
+  malformed Hub repo id (`HFValidationError`) is `ConfigError`, not a download
+  failure.
+- `prefetch --check` reports a cached `config.json` that is valid JSON but not
+  an object (e.g. `null`) as `cached: false` instead of crashing.
+- `shutdown()` wins over an in-flight `start()`: once shutdown begins, a start
+  still running (e.g. one that outlived `serve`'s bounded cancel) never binds a
+  listener or marks the server started; it closes anything it bound and
+  releases the single-server lock itself. A cancel landing mid-bind no longer
+  drops a serving listener.
+- Session tasks that swallow cancellation past the shutdown grace keep the
+  single-server lock until they finish (`TranscriptionServer.stuck_task_count`),
+  and the CLI exits the process instead of hanging in `asyncio.run` teardown.
+- The `<socket>.lock` mode no longer depends on the umask (a `0777` umask made
+  an unopenable mode-000 file); an unopenable existing lock reports `EACCES`
+  with the remedy. The preflight probe opens it non-blocking and reads a FIFO,
+  non-regular or foreign-owned file as "not held" instead of hanging or
+  reporting a spurious running server.
 - `TranscriptionServer.listening_port()` returns `None` for a Unix socket
   instead of a character of its path. `TranscriptionServer` exposes read-only
   `backend` and `config`.

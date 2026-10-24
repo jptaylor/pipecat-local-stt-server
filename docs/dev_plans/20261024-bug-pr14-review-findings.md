@@ -253,8 +253,51 @@ off. Each landed with a regression test that fails on the pre-fix code.
 Deferred (design scope, not fixed here): pinning Kyutai (or any backend) to a
 Hub revision, and a CI job that loads a real Kyutai model.
 
+## Review-gauntlet round 2 fixes
+
+Also below the marker. Each substantive fix has a regression test that was
+mutation-checked (reverting the fix makes it fail).
+
+- **`shutdown()` wins over an in-flight `start()`.** `shutdown()` sets a
+  permanent closing flag; `start()` checks it after `backend.start()` and after
+  the bind, closes whatever it bound (inode-checked unlink) and releases the
+  lock itself. `shutdown()` leaves the lock to an in-flight start, so a start
+  that outlived `serve`'s bounded cancel can neither bind after `serve` returns
+  nor let a new server take the path while it might. The bind is shielded so a
+  cancel mid-bind cannot drop a serving listener.
+- **Stuck session tasks.** Tasks still alive after the cancel grace keep the
+  single-server lock until the last one finishes (`stuck_task_count`). With
+  `hard_exit_on_stop=True` (the CLI) `serve` then `os._exit`s (0 after a
+  requested stop, 1 if failing) instead of hanging in `asyncio.run` teardown;
+  embedders own such tasks.
+- **Lock file.** Mode set by `fchmod` whenever it is not `0600` (umask-proof);
+  an unopenable existing lock is a clear `EACCES`. Both lock opens use
+  `O_NONBLOCK`; the preflight probe `fstat`s and reads a non-regular or
+  foreign-owned file as not held.
+- **Error classification.** `supervise.ConfigError(ValueError)` marks explicit
+  config rejections (`ServerConfig`, socket-dir enforcement, prefetch backend /
+  local-path checks); a bare `ValueError` is `BackendStartError`.
+  `HFValidationError` is `ConfigError`. The kyutai serve-path loader tags an
+  unparseable / incomplete `config.json` `ModelInvalidError`, matching prefetch;
+  a `config.json` that is valid JSON but not an object is an unusable snapshot
+  (`--check`: `cached: false`).
+- **`abort()` contract.** It may run while a decode / lazy-load daemon thread
+  still runs; parakeet/nemotron already tolerate that (the decode fails or
+  completes, `start()` recreates the temp dir). Documented and pinned by a test.
+- **Structure.** `backends.import_backend()` is the single lookup and lazy
+  import; `_resolve_model` takes defaults only from the registry (`None` for
+  echo); `abort_backend` dispatches on the now-exported `AbortableBackend`.
+- **Docs.** README prefetch code fence, per-repo error-code table (unknown code
+  = `BackendStartError`), "Adding a backend" checklist; operations.md kyutai
+  note, lock-file details and the mixed-version upgrade caveat; CHANGELOG.
+
+Needs owner decision (above the review marker, left untouched): the `Status:`
+line still reads In Progress, and Requirements say Kyutai local paths report
+`cached: false` in check mode while the code (and tests) report `ConfigError`.
+
 ## Final Results
 
-- All findings above resolved on `fix/pr14-review-findings`; Ruff format/check
-  clean; full suite green except the pre-existing, unrelated
+- All phases and follow-ups complete on `fix/pr14-review-findings`, including
+  the round-2 fixes; Ruff format/check clean; full suite 519 passed, 3 skipped,
+  1 failed: the pre-existing, unrelated
   `tests/test_justfile_recipes.py::test_stt_list_prints_socket_in_tilde_form`.

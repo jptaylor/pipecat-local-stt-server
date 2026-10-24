@@ -2,8 +2,11 @@
 
 Used by ``serve --supervised`` and ``prefetch --json`` so an app (for example a
 macOS menu bar app managing local speech services) can drive the CLI without
-scraping log text. Mirrors ``tts_server.supervise`` in
-pipecat-local-tts-server, so one supervisor handles both servers.
+scraping log text. The channel mirrors ``tts_server.supervise`` in
+pipecat-local-tts-server, so one supervisor handles both servers; the ``code``
+vocabulary is per repo (STT adds ``ModelInvalidError``, TTS has
+``SocketPathConflict``), and a supervisor should read an unknown code as
+``BackendStartError``.
 
 - **stdout carries only JSON lines**, one compact object per line, flushed.
   While :func:`json_channel` is active ``sys.stdout`` points at stderr, so a
@@ -50,7 +53,8 @@ __all__ = [
 
 logger = logging.getLogger("stt_server")
 
-# Stable ``code`` values for ``{"event": "error"}`` lines (part of the contract).
+# Stable ``code`` values for ``{"event": "error"}`` lines (part of the contract;
+# listed in README "Error codes (per repo)").
 CODE_MODULE_NOT_FOUND = "ModuleNotFoundError"
 CODE_ADDR_IN_USE = "EADDRINUSE"
 CODE_ACCESS_DENIED = "EACCES"

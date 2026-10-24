@@ -18,6 +18,11 @@ between two ASRs from the bot's perspective is which socket it connects to.
 | parakeet | `pipecat.stt-server.parakeet` | `~/Library/Caches/pipecat-stt/parakeet.sock` | set `STT_WS_SOCKET` to the parakeet socket |
 | nemotron | `pipecat.stt-server.nemotron` | `~/Library/Caches/pipecat-stt/nemotron.sock` | set `STT_WS_SOCKET` to the nemotron socket |
 
+`kyutai` has no row on purpose: it is not wired into the LaunchAgent tooling
+(`just stt-install`, the plist renderer). Its extra conflicts with the other MLX
+extras, so it runs from its own environment; start it by hand with
+`--backend kyutai --socket-path <path>` on a socket of your choosing.
+
 ### Single-server lock file
 
 Each Unix socket gets a sibling lock file, `<socket>.lock` (for example
@@ -26,9 +31,12 @@ Each Unix socket gets a sibling lock file, `<socket>.lock` (for example
 fails in milliseconds with `EADDRINUSE` instead of after a multi-GB load, and a
 live server whose listen backlog is full is never mistaken for a stale socket.
 
-- Mode `0600`, owned by the server user. A pre-existing lock file you own with
-  looser permissions is tightened to `0600`; one owned by another user, or a
-  symlink, makes the server refuse to start.
+- Mode `0600`, owned by the server user, set on the open file so the umask
+  never matters. A pre-existing lock file you own with any other mode is reset
+  to `0600`; one owned by another user, a symlink or a non-regular file (e.g. a
+  FIFO) makes the server refuse to start. One you own but cannot open (mode
+  `000`) is reported as `EACCES` with the remedy: `chmod 600` it, or remove it
+  while no server runs.
 - The kernel releases the lock when the server process exits for any reason
   (including `SIGKILL` and the immediate exit on a stop during startup), so it
   cannot go stale.
@@ -37,7 +45,18 @@ live server whose listen backlog is full is never mistaken for a stale socket.
   harmless. Clients never open it.
 - `serve --supervised` checks it before binding (a held lock is reported as
   `EADDRINUSE`). The check takes a shared lock for an instant; a starter retries
-  a contended lock for 250 ms, so the check never makes a real start fail.
+  a contended lock for 250 ms, so the check never makes a real start fail. It
+  opens the file non-blocking and treats anything but a plain file you own as
+  "not held" (the real start then refuses it), so a planted FIFO cannot hang it.
+- If a session task ignores cancellation past the shutdown grace, the lock
+  stays held until that task finishes; `python -m stt_server serve` exits the
+  process at that point, which releases it.
+- **Mixed versions during an upgrade.** The lock only protects against servers
+  that take it. A server started from a release before the lock existed holds
+  none, and on macOS its socket answers `ECONNREFUSED` when its listen backlog
+  is full, which the preflight reads as stale: a new server could then replace
+  that live server's socket. Stop old servers (`just stt-disable <backend>`, or unload their
+  LaunchAgents) before starting upgraded ones on the same socket path.
 
 Whisper uses the default label and socket, so a bot-side default of
 `~/Library/Caches/pipecat-stt/stt.sock` resolves to it with no `.env`
