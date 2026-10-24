@@ -57,8 +57,14 @@ class TranscriptionBackend(Protocol):
 #   non-blocking cleanup -- no thread joins, no Metal drain -- e.g. removing a
 #   private temp dir. ``TranscriptionServer`` calls it when ``start()`` fails
 #   (``close()`` never runs for a server that never started) and from
-#   ``abort_sync()`` before a hard process exit. It may run before ``start()``
-#   and more than once, so it must be idempotent. ``close()`` may call it too.
+#   ``abort_sync()`` before a hard process exit. It may run before ``start()``,
+#   more than once, and while a decode / lazy model-load daemon thread is still
+#   running (threads cannot be cancelled: a stop during warm-up leaves one
+#   behind). So it must be idempotent and must not wait for or break that
+#   thread: anything the thread still uses after ``abort()`` may simply fail
+#   that decode (an error delivered to its awaiter, if any), and a later
+#   ``start()`` must recreate whatever ``abort()`` removed. ``close()`` may call
+#   it too, after its bounded drain.
 # - ``prefetch_specs(model: str | None) -> list[SnapshotSpec]`` (module-level
 #   function in the backend's module, registered in ``backends.BACKENDS``): the
 #   Hugging Face snapshots ``python -m stt_server prefetch`` fetches/checks so
@@ -68,15 +74,16 @@ class TranscriptionBackend(Protocol):
 
 @runtime_checkable
 class AbortableBackend(Protocol):
+    """A backend implementing the optional ``abort()`` hook (contract above)."""
+
     def abort(self) -> None: ...
 
 
 def abort_backend(backend: object, log) -> None:
-    """Call ``backend.abort()`` if it implements the optional hook; log failures."""
-    abort = getattr(backend, "abort", None)
-    if callable(abort):
+    """Call ``backend.abort()`` if it is an :class:`AbortableBackend`; log failures."""
+    if isinstance(backend, AbortableBackend):
         try:
-            abort()
+            backend.abort()
         except Exception:  # noqa: BLE001 -- best-effort cleanup
             log.exception("stt_server: backend abort failed")
 

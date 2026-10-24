@@ -859,3 +859,63 @@ def test_kyutai_serve_path_unusable_config_is_model_invalid(monkeypatch, tmp_pat
     with pytest.raises(Exception) as exc:
         KyutaiBackend(model="x/y")._get_model()
     assert supervise.classify_startup_error(exc.value)[0] == "ModelInvalidError"
+
+
+@pytest.mark.parametrize("backend_name", ["parakeet", "nemotron"])
+def test_abort_while_decode_thread_runs_is_safe(monkeypatch, backend_name):
+    """``abort()`` contract: it may run while a decode / lazy-load daemon thread
+    is still going (a stop during warm-up leaves one behind). Cells: abort while
+    the thread is inside the model call, abort again (idempotent), the thread
+    then finishes without hanging, and a later ``start()`` recreates the temp
+    dir so decoding works again; abort before a decode makes that decode fail
+    cleanly, never hang."""
+    import asyncio
+    import threading
+
+    if backend_name == "parakeet":
+        from stt_server.backends.parakeet import ParakeetBackend as cls
+
+        _fake_modules(monkeypatch, parakeet_mlx={})
+    else:
+        from stt_server.backends.nemotron import NemotronBackend as cls
+
+        _fake_modules(monkeypatch, mlx_audio={}, **{"mlx_audio.stt": {"load": _reset}})
+    entered, release = threading.Event(), threading.Event()
+
+    class FakeModel:
+        def _run(self, path, **_kwargs):
+            entered.set()
+            release.wait(5)
+            return SimpleNamespace(text="hi")
+
+        transcribe = generate = _run
+
+    async def decode(backend):
+        stream = await backend.open_stream()
+        await stream.feed(b"\x00\x00" * 160)
+        await stream.end()
+        return [ev.text async for ev in stream.events()]
+
+    async def body():
+        backend = cls(model="x/y")
+        backend._get_model = lambda: FakeModel()
+        try:
+            task = asyncio.ensure_future(decode(backend))
+            assert await asyncio.get_running_loop().run_in_executor(None, entered.wait, 5)
+            backend.abort()  # the decode thread is mid-call
+            backend.abort()  # idempotent
+            assert not os.path.isdir(backend._tmpdir)
+            release.set()
+            await asyncio.wait_for(asyncio.wait({task}), timeout=5)
+            assert task.done()
+            # Abort before a decode: the decode fails cleanly (no hang)...
+            with pytest.raises(OSError):
+                await asyncio.wait_for(decode(backend), timeout=5)
+            # ...and a later start() recreates what abort() removed.
+            await backend.start()
+            assert await asyncio.wait_for(decode(backend), timeout=5) == ["hi", "hi"]
+        finally:
+            release.set()
+            backend.abort()
+
+    asyncio.run(body())

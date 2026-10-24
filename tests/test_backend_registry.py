@@ -70,3 +70,42 @@ def test_snapshot_spec_is_stdlib_only_and_reexported():
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
     assert out.stdout.strip() == "[]"
+
+
+def test_model_default_comes_only_from_the_registry():
+    """``default_model=None`` means "no model": no hidden Whisper fallback."""
+    assert BACKENDS["echo"].default_model is None
+    assert M._resolve_model("echo", None) is None
+    assert M._resolve_model("echo", "x/y") == "x/y"
+
+
+def test_import_backend_is_the_single_lookup(monkeypatch):
+    from stt_server import backends as B
+
+    assert B.import_backend("echo") is None
+    with pytest.raises(KeyError):
+        B.import_backend("nope")
+    seen = []
+    real = B.import_backend
+    monkeypatch.setattr(B, "import_backend", lambda n: seen.append(n) or real(n))
+    monkeypatch.setattr(M, "import_backend", B.import_backend)
+    M._make_backend("echo", None)
+    PF.specs_for("echo", None)
+    assert seen == ["echo", "echo"]
+
+
+def test_abort_backend_uses_the_abortable_protocol():
+    from stt_server import AbortableBackend
+    from stt_server.backend import EchoBackend, abort_backend
+
+    class WithAbort(EchoBackend):
+        aborted = 0
+
+        def abort(self):
+            self.aborted += 1
+
+    b = WithAbort()
+    assert isinstance(b, AbortableBackend) and not isinstance(EchoBackend(), AbortableBackend)
+    abort_backend(b, None)
+    abort_backend(EchoBackend(), None)  # no hook: nothing to call
+    assert b.aborted == 1

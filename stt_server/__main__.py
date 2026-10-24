@@ -32,7 +32,7 @@ from .backend import EchoBackend
 
 # The backend registry (``backends/__init__.py``) is stdlib-only: reading it
 # imports no backend module, so the serve path stays lean at every launch.
-from .backends import BACKENDS
+from .backends import BACKENDS, import_backend
 from .backends import DEFAULT_MLX_MODEL as _DEFAULT_MLX_MODEL  # noqa: F401 (compat)
 from .env import env_first
 from .server import serve
@@ -42,7 +42,7 @@ from .server import serve
 # doesn't pay for ``websockets.asyncio.client`` it never uses.
 
 
-def _make_backend(name: str, model: str):
+def _make_backend(name: str, model: str | None):
     """Construct the ``--backend`` named ``name`` (see ``backends.BACKENDS``).
 
     The backend module is imported lazily, here, so a base install without an
@@ -51,22 +51,20 @@ def _make_backend(name: str, model: str):
     imported only inside ``start()``/``_get_model``), so a missing extra
     surfaces fast in ``start()``, not at construction.
     """
-    entry = BACKENDS.get(name)
-    if entry is None:
-        raise SystemExit(f"unknown backend: {name}")
-    if entry.module is None:
+    try:
+        module = import_backend(name)
+    except KeyError:
+        raise SystemExit(f"unknown backend: {name}") from None
+    if module is None:
         return EchoBackend()
-    import importlib
-
-    cls = getattr(importlib.import_module(entry.module), entry.class_name)
-    return cls(model=model)
+    return getattr(module, BACKENDS[name].class_name)(model=model)
 
 
 # Every ``--backend`` name; shared by ``serve`` and ``prefetch``.
 BACKEND_CHOICES = tuple(BACKENDS)
 
 
-def _resolve_model(backend: str, model: str | None) -> str:
+def _resolve_model(backend: str, model: str | None) -> str | None:
     """Resolve the effective decode model id.
 
     An explicit ``--model`` always wins (it is passed through verbatim — the
@@ -75,14 +73,13 @@ def _resolve_model(backend: str, model: str | None) -> str:
     repo id as "whisper" vs "parakeet" would need a brittle string heuristic).
     When ``--model`` is unset the default is the backend's own
     ``BACKENDS[backend].default_model`` (e.g. ``DEFAULT_PARAKEET_MODEL`` for
-    ``parakeet``), falling back to the Whisper repo for a backend with none.
+    ``parakeet``); ``None`` for a backend with no model (echo) -- the registry
+    is the only source of defaults.
     """
     if model is not None:
         return model
     entry = BACKENDS.get(backend)
-    if entry is not None and entry.default_model is not None:
-        return entry.default_model
-    return _DEFAULT_MLX_MODEL
+    return entry.default_model if entry is not None else None
 
 
 def _resolve_auth_token(token_file: str | None, *, client: bool = False) -> str | None:

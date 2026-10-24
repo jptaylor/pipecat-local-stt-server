@@ -16,7 +16,13 @@ Import layout reflects the ``client`` vs ``mlx`` extras split:
 
 from __future__ import annotations
 
-from .backend import BackendStream, EchoBackend, TranscriptEvent, TranscriptionBackend
+from .backend import (
+    AbortableBackend,
+    BackendStream,
+    EchoBackend,
+    TranscriptEvent,
+    TranscriptionBackend,
+)
 from .client import TranscriptionClient
 from .protocol import (
     AUDIO_CHANNELS,
@@ -41,6 +47,7 @@ __all__ = [
     "MAX_APPEND_BYTES",
     "ErrorCode",
     "TranscriptionBackend",
+    "AbortableBackend",
     "BackendStream",
     "TranscriptEvent",
     "EchoBackend",

@@ -37,7 +37,6 @@ from __future__ import annotations
 
 import contextlib
 import fnmatch
-import importlib
 import json
 import logging
 import os
@@ -111,10 +110,13 @@ def _entry(backend: str):
 
 def specs_for(backend: str, model: str | None) -> list[SnapshotSpec]:
     """Every snapshot ``backend`` needs to start ``model`` without the network."""
-    entry = _entry(backend)
-    if entry.module is None:
+    from .backends import import_backend
+
+    _entry(backend)  # unknown name -> ConfigError
+    module = import_backend(backend)
+    if module is None:
         return []  # echo: no model
-    return list(importlib.import_module(entry.module).prefetch_specs(model))
+    return list(module.prefetch_specs(model))
 
 
 def local_specs_for(backend: str, model: str) -> list[SnapshotSpec]:

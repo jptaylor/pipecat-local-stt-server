@@ -14,6 +14,7 @@ module-level ``prefetch_specs(model) -> list[SnapshotSpec]`` (see
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import ModuleType
 
 # Default model per backend: single definitions, re-exported by each backend
 # module (``backends.parakeet.DEFAULT_PARAKEET_MODEL`` etc.).
@@ -55,3 +56,18 @@ BACKENDS: dict[str, BackendEntry] = {
         local_model_paths=False,
     ),
 }
+
+
+def import_backend(name: str) -> ModuleType | None:
+    """Import the module behind ``--backend name`` (``None`` for echo).
+
+    The one place that looks a name up and imports its module lazily, for the
+    CLI constructor and ``prefetch``. Raises ``KeyError`` for an unknown name;
+    each caller turns that into its own error.
+    """
+    entry = BACKENDS[name]
+    if entry.module is None:
+        return None
+    import importlib
+
+    return importlib.import_module(entry.module)
