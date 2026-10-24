@@ -235,19 +235,35 @@ def acquire_socket_lock(socket_path: str | os.PathLike) -> int:
     place on exit (unlinking it would race a concurrent starter). It is created
     0600; a pre-existing one we own with group/other bits is tightened to 0600
     (another uid able to open it could hold the lock and block every future
-    server), and one we do not own is refused. Raises ``OSError(EADDRINUSE)``
-    when another process holds it for longer than a brief probe would.
+    server), and one we do not own is refused. The mode is set with ``fchmod``
+    on the open fd, so it never depends on the process umask (a ``0o777`` umask
+    would otherwise create a mode-000 file no later start could open). Raises
+    ``OSError(EADDRINUSE)`` when another process holds it for longer than a
+    brief probe would, and ``OSError(EACCES)`` naming the remedy when an
+    existing lock file cannot be opened.
     """
     import errno
     import fcntl
 
     path = _lock_path(socket_path)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        # O_NONBLOCK: a FIFO planted at the path must not block the open.
+        fd = os.open(
+            path,
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+            0o600,
+        )
+    except PermissionError as exc:
+        raise OSError(
+            errno.EACCES,
+            f"cannot open the single-server lock file {path} ({exc.strerror}); "
+            "if it is yours, chmod 600 it (or remove it while no server runs)",
+        ) from exc
     try:
         st = os.fstat(fd)
         if not _stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
             raise OSError(errno.EACCES, f"{path} is not a regular file owned by this user")
-        if st.st_mode & 0o077:
+        if _stat.S_IMODE(st.st_mode) != 0o600:
             os.fchmod(fd, 0o600)
         deadline = time.monotonic() + _LOCK_RETRY_SECONDS
         while True:
@@ -283,10 +299,19 @@ def socket_lock_held(socket_path: str | os.PathLike) -> bool:
     import fcntl
 
     try:
-        fd = os.open(_lock_path(socket_path), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        # O_NONBLOCK: preflight runs before the socket-directory trust check, so
+        # the path may be in a directory another user writes; a FIFO planted
+        # there must not hang the open.
+        fd = os.open(
+            _lock_path(socket_path),
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+        )
     except OSError:
         return False
     try:
+        st = os.fstat(fd)
+        if not _stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+            return False  # not a plain owned file: start() reports it
         try:
             fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except OSError as exc:

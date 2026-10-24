@@ -588,3 +588,71 @@ def test_cli_exits_when_a_session_task_outlives_shutdown():
         if proc.poll() is None:
             proc.kill()
             proc.wait()
+
+
+def test_lock_mode_does_not_depend_on_umask(tmp_path):
+    """A ``0o777`` umask masks the create mode to 000; a later start must still
+    open the lock file, so the mode is set on the fd, not by ``open``."""
+    sock = tmp_path / "a.sock"
+    prior = os.umask(0o777)
+    try:
+        os.close(acquire_socket_lock(sock))
+    finally:
+        os.umask(prior)
+    assert (Path(f"{sock}.lock").stat().st_mode & 0o777) == 0o600
+    os.close(acquire_socket_lock(sock))  # reopenable by the next start
+
+
+def test_unopenable_existing_lock_file_reports_a_clear_eacces(tmp_path):
+    sock = tmp_path / "a.sock"
+    lock = Path(f"{sock}.lock")
+    lock.write_text("")
+    os.chmod(lock, 0)
+    try:
+        if os.access(lock, os.R_OK):
+            pytest.skip("running with privileges that bypass file modes")
+        with pytest.raises(OSError) as exc:
+            acquire_socket_lock(sock)
+        assert exc.value.errno == errno.EACCES
+        assert "chmod 600" in str(exc.value)
+    finally:
+        os.chmod(lock, 0o600)
+
+
+def _returns_within(fn, timeout):
+    import threading
+
+    box = {}
+    t = threading.Thread(target=lambda: box.setdefault("v", fn()), daemon=True)
+    t.start()
+    t.join(timeout)
+    return (not t.is_alive()), box.get("v")
+
+
+def test_probe_does_not_hang_on_a_planted_fifo(tmp_path):
+    sock = tmp_path / "a.sock"
+    fifo = Path(f"{sock}.lock")
+    os.mkfifo(fifo)
+    try:
+        finished, held = _returns_within(lambda: socket_lock_held(sock), 2)
+        assert finished, "socket_lock_held blocked opening a FIFO"
+        assert held is False
+        finished, _ = _returns_within(lambda: pytest.raises(OSError, acquire_socket_lock, sock), 2)
+        assert finished, "acquire_socket_lock blocked opening a FIFO"
+    finally:
+        # Unblock a mutant's blocked reader, if any.
+        try:
+            os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        except OSError:
+            pass
+
+
+def test_probe_treats_a_foreign_owned_lock_as_not_held(tmp_path, monkeypatch):
+    sock = tmp_path / "a.sock"
+    fd = acquire_socket_lock(sock)  # a held, regular lock file
+    try:
+        real = os.geteuid()
+        monkeypatch.setattr(os, "geteuid", lambda: real + 1)
+        assert socket_lock_held(sock) is False
+    finally:
+        os.close(fd)
