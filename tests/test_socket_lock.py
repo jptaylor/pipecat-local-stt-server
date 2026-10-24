@@ -313,7 +313,7 @@ async def test_failed_backend_close_still_releases_lock(short_home):
     with pytest.raises(RuntimeError):
         await srv.shutdown()
     assert socket_lock_held(sock) is False
-    assert srv._started is False
+    assert srv.state == "stopped"
     await srv.shutdown()  # a second call returns instead of spinning
 
 
@@ -333,7 +333,7 @@ async def test_cancelled_shutdown_still_releases_lock(short_home):
     await asyncio.sleep(0.05)
     task.cancel()
     await asyncio.wait({task})
-    assert socket_lock_held(sock) is False and srv._started is False
+    assert socket_lock_held(sock) is False and srv.state == "stopped"
 
 
 async def test_shutdown_is_bounded_when_a_task_swallows_cancellation(monkeypatch):
@@ -397,7 +397,7 @@ async def test_shutdown_during_backend_start_never_binds(short_home):
     gate.set()
     with pytest.raises(RuntimeError):
         await task
-    assert srv._started is False and srv.sockets_bound == []
+    assert srv.state == "stopped" and srv.sockets_bound == []
     assert not sock.exists()
     assert socket_lock_held(sock) is False
     assert backend.aborts == 1
@@ -416,13 +416,13 @@ async def test_shutdown_during_bind_closes_the_bound_listener(short_home, monkey
 
     async def bind_then_shutdown(*a, **k):
         listener = await real_bind(*a, **k)
-        await srv.shutdown()  # lands between the bind and ``_started = True``
+        await srv.shutdown()  # lands between the bind and RUNNING
         return listener
 
     monkeypatch.setattr(S, "ws_unix_serve", bind_then_shutdown)
     with pytest.raises(RuntimeError):
         await srv.start()
-    assert srv._started is False and srv.sockets_bound == []
+    assert srv.state == "stopped" and srv.sockets_bound == []
     assert not sock.exists()
     assert socket_lock_held(sock) is False
     await asyncio.sleep(0)

@@ -252,7 +252,7 @@ async def test_shutdown_is_idempotent_under_double_call(monkeypatch):
         for r in results:
             assert not isinstance(r, Exception), f"shutdown raised: {r!r}"
         # backend.close() fires from the first shutdown; the second is a
-        # no-op because ``_started`` was flipped false.
+        # no-op because the server is already stopped.
         assert backend.close_count == 1
     finally:
         try:
