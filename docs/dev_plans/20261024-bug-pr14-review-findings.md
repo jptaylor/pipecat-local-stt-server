@@ -484,9 +484,37 @@ that did not fail closed. Fixed together:
   when `start()` had not returned; `_CANCEL_GRACE_SECONDS` / `_on_close`
   comments; test renamed `test_cli_stuck_work_exit_still_reports_the_failure`.
 
+### Round 8
+
+- **Required alternatives are structural.** `SnapshotSpec.required` entries
+  are a glob or a tuple of alternative globs (`("weights.safetensors",
+  "weights.npz")`); `_complete` no longer splits strings on `|`, and
+  `check_plain_filenames` rejects `|`. Old invariant: "a `required` string may
+  carry `a|b`", which made a Kyutai config name `x|config.json` pass
+  completeness on `config.json`; new: "a string entry is one literal glob".
+  Consumers swept: `_complete`, `_validated` (error text), `check_spec`,
+  `fetch_spec`, local paths, the mlx spec. Alternatives are tested through Hub
+  check, Hub fetch and local fetch.
+- **Unexpandable `~user` model** is a missing local model (`cached: false` /
+  `ModelInvalidError`), not a `BackendStartError` from `expanduser`.
+- **serve() uses only public API.** `adopt(task, stuck=..., kind=...)` (kind
+  `adopted` or `readiness`) and `live_work_reasons` replace serve's calls to
+  `_track` / `_live_reasons`; which signal an embedder reads is documented
+  once, in the `TranscriptionServer` docstring. `start()`'s `finally` drops
+  its entry through `_end_work` (the one removal). The two hard exits are one
+  routine (`abort` yes/no, exit code, failure to `on_fatal`), behaviour per
+  call site unchanged.
+- **No double wait.** `_abandon_step` clears `pending` before waiting, so a
+  cancel of `serve` during a stop's bounded wait does not start a second one.
+- Test added: a healthy `hard_exit_on_stop=True` shutdown with an idle and a
+  mid-utterance client returns without `os._exit`, ledger empty, `stopped`.
+- Docs: CHANGELOG / `serve()` / `wait_stopped()` / `__main__` comment name
+  live work, not `stuck_work_count`; README "Adding a backend" step 1 defines
+  `required`.
+
 ## Final Results
 
 - All phases and follow-ups complete on `fix/pr14-review-findings`, including
-  the round-2 to round-7 fixes; Ruff format/check clean; full suite 578 passed, 3 skipped,
+  the round-2 to round-8 fixes; Ruff format/check clean; full suite 593 passed, 3 skipped,
   1 failed: the pre-existing, unrelated
   `tests/test_justfile_recipes.py::test_stt_list_prints_socket_in_tilde_form`.
