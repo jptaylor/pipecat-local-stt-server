@@ -67,9 +67,11 @@ class TranscriptionBackend(Protocol):
 #   thread: anything the thread still uses after ``abort()`` may simply fail
 #   that decode (an error delivered to its awaiter, if any), and a later
 #   ``start()`` of the same backend must recreate whatever ``abort()`` removed:
-#   a ``TranscriptionServer`` whose ``start()`` failed may be started again (a
-#   shut-down one may not -- it is single-use -- but its backend may be handed
-#   to a new server). ``close()`` may call it too, after its bounded drain.
+#   a ``TranscriptionServer`` whose failed ``start()`` returned it to ``new``
+#   may be started again, and its backend may always be handed to a new server
+#   (a server is single-use once ``shutdown()`` was called or a failed start
+#   left work running, i.e. it is ``stopping``). ``close()`` may call it too,
+#   after its bounded drain.
 # - ``idle()`` (instance method, :class:`IdleAwareBackend`): returns an
 #   ``asyncio.Future`` that completes once no backend-owned worker thread (a
 #   decode daemon thread) is still running. Must not block. Cancelling a decode

@@ -32,11 +32,11 @@ fails in milliseconds with `EADDRINUSE` instead of after a multi-GB load, and a
 live server whose listen backlog is full is never mistaken for a stale socket.
 
 - Mode `0600`, owned by the server user, set on the open file so the umask
-  never matters. A pre-existing lock file you own with any other mode is reset
-  to `0600`; one owned by another user, a symlink or a non-regular file (e.g. a
-  FIFO) makes the server refuse to start. One you own but cannot open (mode
-  `000`) is reported as `EACCES` with the remedy: `chmod 600` it, or remove it
-  while no server runs.
+  never matters. A pre-existing lock file you own that opens read-write is set
+  to `0600` whatever its mode. One you own but cannot open read-write (e.g. mode
+  `000` or `0400`) is reported as `EACCES` with the remedy: `chmod 600` it, or
+  remove it while no server runs. One owned by another user, a symlink or a
+  non-regular file (e.g. a FIFO) makes the server refuse to start.
 - The kernel releases the lock when the server process exits for any reason
   (including `SIGKILL` and the immediate exit on a stop during startup), so it
   cannot go stale.
@@ -52,7 +52,11 @@ live server whose listen backlog is full is never mistaken for a stale socket.
   thread is still running on the GPU after its task was cancelled, or
   `backend.close()` is still running past its bound (the drain timeout, 10 s),
   the lock stays held until that work finishes (also when the shutdown itself
-  was cancelled, or when the work was left by a failed start);
+  was cancelled, or when the work was left by a failed start: that server then
+  stays `stopping` and is single-use, while a failed start that left nothing
+  running returns to `new` and may be retried). In-process callers await
+  `TranscriptionServer.wait_stopped()` for the lock to be free: `shutdown()`
+  returning does not guarantee it;
   `python -m stt_server serve` exits the process at that point,
   which releases it. A failure in flight at that exit (for example
   `backend.close()` raising) is still printed and, under `--supervised`,

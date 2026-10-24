@@ -16,8 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (macOS returns `ECONNREFUSED` for both). The kernel drops the lock when the
   process dies, so it cannot go stale; clients never touch it, so any number
   share one server. The lock file is left in place on exit. A pre-existing lock
-  file we own with group/other permission bits is tightened to `0600`; one owned
-  by another user is refused. The preflight probe takes a shared lock and a
+  file we own that opens read-write is set to `0600` whatever its mode; one we
+  cannot open (e.g. mode `000`) is refused with `EACCES` naming the remedy
+  (`chmod 600`); one owned by another user, or not a regular file, is refused. The preflight probe takes a shared lock and a
   starter retries a contended lock for 250 ms, so a probe never makes a
   concurrent real start fail.
 - `ModelInvalidError` supervised/prefetch error code: the model snapshot is
@@ -34,8 +35,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   documented in `stt_server/backend.py`. `backends.import_backend()` is the one
   lookup-and-import and returns the entry, module and class. README has an
   "Adding a backend" checklist.
-- `TranscriptionServer.state` (`new`/`starting`/`running`/`stopping`/`stopped`)
-  and `holds_socket_lock`.
+- `TranscriptionServer.state` (`new`/`starting`/`running`/`stopping`/`stopped`),
+  `holds_socket_lock`, and `wait_stopped()`: waits until the lock is free and
+  no work runs (`stopped`, or `new` after a failed start). `shutdown()`
+  returning does not always mean that (from `starting`, or with leftover work
+  past its bounds); await `wait_stopped()` before starting a new server on the
+  same socket or closing the event loop.
 - **`serve --supervised`** for a managing parent process: stdout carries only
   JSON lines (`ready` once listening and warm, with the real port; or `error`
   with a stable `code` such as `EADDRINUSE`, `ModuleNotFoundError`,
@@ -67,8 +72,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as a re-export.
 - `--model` defaults come only from `backends.BACKENDS[...].default_model`.
 - `TranscriptionServer` is **single-use**: after `shutdown()` (in any state,
-  including before `start()`) `start()` raises `RuntimeError`; build a new
-  server to serve again. A failed or cancelled `start()` returns the server to
+  including before `start()`), or once a failed start left work running
+  (`stopping`), `start()` raises `RuntimeError` naming which of the two
+  happened; build a new server to serve again. A failed or cancelled `start()` returns the server to
   `new` and may be retried, unless work it started outlived its cleanup (a
   session, a backend `close()`, a bind finishing after a second cancel): then
   it stays `stopping`, holding the lock until that work ends, and is
@@ -143,6 +149,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cancelled `shutdown()` no longer abandons `backend.close()` and later
   callers wait for it; and `serve` keeps a startup/readiness step that ignored
   its cancel as live work (lock held until it ends, its failure logged).
+- Live work is one ledger: the lock decision and `stuck_task_count` (what the
+  CLI's hard exit reads) are views of it, so they can no longer disagree. A
+  bind that finished after a second cancel, its listener's close, and a
+  backend decode thread now count in `stuck_task_count`; sessions are live
+  work from creation; an orphaned listener keeps the lock until its socket has
+  really closed. A failed start that returns to `new` resets every per-attempt
+  slot, so a retry closes its backend again (it reused the first attempt's
+  finished close, leaving the backend open) and never acts on the first
+  attempt's socket inode.
 - `prefetch --check` reports a malformed Hub repo id as `ConfigError` (exit 1),
   as a fetch does, instead of `cached: false`.
 - The `<socket>.lock` mode no longer depends on the umask (a `0777` umask made

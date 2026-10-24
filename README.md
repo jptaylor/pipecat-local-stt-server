@@ -278,7 +278,11 @@ menu bar app. Logging on stderr is unchanged. In addition:
   open, so the server exits when the parent closes it or dies. During startup
   the process exits at once; interrupted downloads resume next time. (Embedding
   `stt_server.server.serve()` in your own process? It cancels startup and shuts
-  down normally instead, unless you pass `hard_exit_on_stop=True`.)
+  down normally instead, unless you pass `hard_exit_on_stop=True`. A
+  `TranscriptionServer` is single-use once `shutdown()` was called or a failed
+  start left work running (`stopping`); a failed start that returned to `new`
+  may be retried. Await `wait_stopped()` before reusing the socket: the lock
+  can outlive `shutdown()`.)
 
 ```bash
 ( sleep 5 ) | uv run python -m stt_server serve --backend echo \
@@ -301,7 +305,7 @@ but each repo has its own code list:
 | `ModuleNotFoundError` | yes | the backend's extra is not installed |
 | `ModelDownloadError` | yes | a model fetch failed (network library error, or a network error during a fetch) |
 | `ModelInvalidError` | yes (STT only) | the cached or local model is incomplete or unreadable (missing files, a `config.json` that does not parse or name its files) |
-| `ConfigError` | yes | a rejected endpoint or CLI input: non-loopback host, missing endpoint, an untrusted socket directory, a malformed Hub repo id, an unsupported local model path |
+| `ConfigError` | yes | a rejected endpoint or CLI input: non-loopback host, missing endpoint, an untrusted socket directory, a malformed Hub repo id, an unsupported local model path, an unknown backend name (`--backend` / `import_backend()`) |
 | `BackendStartError` | yes | anything else |
 
 `pipecat-local-tts-server` has no `ModelInvalidError` and adds
@@ -326,7 +330,9 @@ A backend is registered in one place and picked up by `--backend`, the
 3. **Optional `abort()`** if the backend owns cleanup that must survive a failed
    start or a hard exit (e.g. a private temp dir): synchronous, idempotent, safe
    while a decode thread still runs, and undone by the next `start()`. A failed
-   start calls it after `close()` when the backend's `start()` had returned.
+   start calls it after `close()` when the backend's `start()` had returned; the
+   server may then be retried (a failed start that left work running is
+   single-use instead, but the backend can go to a new server).
    Optional `idle()` (`IdleAwareBackend`) reports when no decode thread is left;
    the server keeps its lock until then. The full contracts are in
    `stt_server/backend.py`.

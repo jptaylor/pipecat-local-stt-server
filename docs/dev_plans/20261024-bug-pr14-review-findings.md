@@ -366,6 +366,43 @@ splitting `server.py` (socket-dir security / lock / lifecycle / protocol /
 `serve`), moving the error markers and `mark_*` helpers from `snapshot.py` /
 `supervise.py` into `errors.py`, and a typed `prefetch_specs` protocol.
 
+### Round 5 (review gauntlet)
+
+Two residual root causes behind the round-5 server findings, fixed
+structurally:
+
+- **Per-attempt state survived a failed start's return to `new`.** The retry's
+  shutdown reused attempt 1's finished `_close_task` (backend never closed:
+  starts=2, closes=1, or attempt 1's close error re-raised), and `_server` /
+  `_bound_socket_id` kept attempt 1's listener and socket inode. Now one reset
+  point, `_reset_attempt()`, runs on every transition into `new` (only legal
+  with no live work) and clears every per-attempt slot together: listener,
+  socket inode, close task, drain task, session sets, the ledger's finished
+  entries, the shutdown event.
+- **Two ledgers for leftover work.** `_live_work` gated the lock while
+  `_lingering` fed `stuck_task_count` (serve's hard exit), so an orphan bind or
+  an `idle()` future held the lock without counting as stuck. Now one ledger
+  (`_live_work: dict[key, _Work(kind, stuck)]`): `_live_reasons()` and
+  `stuck_task_count` are both views of it; the listener and session/decode
+  tasks (tracked from creation) are entries; an orphan bind, its listener's
+  `wait_closed`, a backend worker thread and an adopted step are entered as
+  stuck. The orphan listener's lock is released only after its socket really
+  closed (`Server.close()` only schedules it).
+- `wait_stopped()` is the public "lock is free" wait (tests no longer use the
+  private event); `shutdown()` documents that returning does not always mean
+  that. `start()` from `stopping`/`stopped` names the cause (shutdown vs a
+  failed start that left work running).
+- Docs: single-use rule (shutdown, or failed start left work running) in the
+  class docstring, `backend.py` `abort()` contract, CHANGELOG, operations.md,
+  README; the `shutdown()` bound (drain timeout + two cancel graces + close
+  bound); one lock-file mode rule matching the code; README `ConfigError` row
+  lists an unknown backend name.
+
+Quarantined in round 5: closing the event loop while an `idle()` future is
+pending strands the lock until process exit (the release runs as a loop
+callback; a fix needs an off-loop release path). Documented in
+`wait_stopped()`: await it before closing the loop.
+
 ## Final Results
 
 - All phases and follow-ups complete on `fix/pr14-review-findings`, including
