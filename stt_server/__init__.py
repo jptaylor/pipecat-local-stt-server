@@ -20,6 +20,7 @@ from .backend import (
     AbortableBackend,
     BackendStream,
     EchoBackend,
+    IdleAwareBackend,
     TranscriptEvent,
     TranscriptionBackend,
 )
@@ -49,6 +50,7 @@ __all__ = [
     "ErrorCode",
     "TranscriptionBackend",
     "AbortableBackend",
+    "IdleAwareBackend",
     "BackendStream",
     "TranscriptEvent",
     "EchoBackend",

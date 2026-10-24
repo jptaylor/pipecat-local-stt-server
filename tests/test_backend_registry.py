@@ -122,6 +122,16 @@ def test_abort_backend_uses_the_abortable_protocol():
     assert b.aborted == 1
 
 
+def test_optional_backend_hooks_are_exported_together():
+    """Both optional-hook protocols are public, from the package root."""
+    import stt_server
+    from stt_server import AbortableBackend, IdleAwareBackend, backend
+
+    assert {"AbortableBackend", "IdleAwareBackend"} <= set(stt_server.__all__)
+    assert AbortableBackend is backend.AbortableBackend
+    assert IdleAwareBackend is backend.IdleAwareBackend
+
+
 def test_config_error_lives_outside_the_cli_layer():
     """The server core and prefetch raise ``ConfigError`` without importing the
     supervisor channel; ``supervise.ConfigError`` and the package export are the
