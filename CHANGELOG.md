@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Single-server lock for Unix sockets.** `start()` takes an `flock` on
+  `<socket>.lock` (mode `0600`, next to the socket) before the model loads, and
+  the supervised preflight treats a held lock as a live server. `connect()`
+  alone cannot tell a stale socket from a live one with a full listen backlog
+  (macOS returns `ECONNREFUSED` for both). The kernel drops the lock when the
+  process dies, so it cannot go stale; clients never touch it, so any number
+  share one server. The lock file is left in place on exit.
+
 - **`serve --supervised`** for a managing parent process: stdout carries only
   JSON lines (`ready` once listening and warm, with the real port; or `error`
   with a stable `code` such as `EADDRINUSE`, `ModuleNotFoundError`,

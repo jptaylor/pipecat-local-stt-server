@@ -203,6 +203,69 @@ def _enforce_socket_dir_secure(path: Path, trusted_root: Path) -> Path:
     return path
 
 
+def _lock_path(socket_path: str | os.PathLike) -> str:
+    return f"{socket_path}.lock"
+
+
+def acquire_socket_lock(socket_path: str | os.PathLike) -> int:
+    """Take the single-server lock for ``socket_path``; return the held fd.
+
+    ``connect()`` cannot tell a stale socket from a live one whose listen
+    backlog is full (macOS returns ECONNREFUSED for both), so liveness is
+    decided by an ``flock`` on ``<socket>.lock`` instead. The kernel drops the
+    lock when the owning process dies, so it can never go stale; clients never
+    touch it, so any number of them share one server. The lock file is left in
+    place on exit (unlinking it would race a concurrent starter). Raises
+    ``OSError(EADDRINUSE)`` when another process holds it.
+    """
+    import errno
+    import fcntl
+
+    path = _lock_path(socket_path)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        st = os.fstat(fd)
+        if not _stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+            raise OSError(errno.EACCES, f"{path} is not a regular file owned by this user")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+                raise OSError(
+                    errno.EADDRINUSE, f"a server is already running for {socket_path}"
+                ) from exc
+            raise
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def socket_lock_held(socket_path: str | os.PathLike) -> bool:
+    """True when another process holds the lock for ``socket_path``.
+
+    Read-only probe for preflight: never creates the lock file, never follows a
+    symlink, and treats anything that is not a plain owned file as "not held"
+    (``start()`` will report it properly when it tries to acquire).
+    """
+    import errno
+    import fcntl
+
+    try:
+        fd = os.open(_lock_path(socket_path), os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            return exc.errno in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
 @dataclass
 class ServerConfig:
     """Transport and policy configuration for ``TranscriptionServer``."""
@@ -259,12 +322,13 @@ class TranscriptionServer:
         # (st_dev, st_ino) of the Unix socket file THIS process bound, recorded
         # right after bind so ``abort_sync`` only ever unlinks our own inode.
         self._bound_socket_id: tuple[int, int] | None = None
+        self._socket_lock_fd: int | None = None
 
     # --- lifecycle ---
     async def start(self) -> None:
         if self._started:
             return
-        await self._backend.start()
+        verified_socket: Path | None = None
         if self._config.socket_path:
             socket_path = Path(self._config.socket_path)
             # Trusted root for the ancestor walk: the user's home directory. The
@@ -279,6 +343,27 @@ class TranscriptionServer:
             # symlink component and returns the literal verified path, so the
             # chain we vouched for is exactly the one clients traverse.
             verified_socket = _enforce_socket_dir_secure(socket_path, Path.home())
+            # Single-server lock BEFORE the model load: a second instance fails
+            # in milliseconds instead of after a multi-GB load, and the socket
+            # file below is only ever replaced by the lock holder.
+            self._socket_lock_fd = acquire_socket_lock(verified_socket)
+        try:
+            await self._start_locked(verified_socket)
+        except BaseException:
+            self._release_socket_lock()
+            raise
+
+    def _release_socket_lock(self) -> None:
+        fd, self._socket_lock_fd = self._socket_lock_fd, None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    async def _start_locked(self, verified_socket: Path | None) -> None:
+        await self._backend.start()
+        if verified_socket is not None:
             # Restrict the socket file to owner-only before bind so the UDS
             # trust boundary actually holds on multi-user hosts.
             prior_umask = os.umask(0o077)
@@ -379,6 +464,7 @@ class TranscriptionServer:
                     os.unlink(path)
             except OSError:
                 pass
+        self._release_socket_lock()
         abort = getattr(self._backend, "abort", None)
         if callable(abort):
             try:
@@ -394,6 +480,7 @@ class TranscriptionServer:
         process never wedges on MLX/Metal teardown.
         """
         if not self._started:
+            self._release_socket_lock()
             return
         # launchd sends SIGTERM once, but defensive double-shutdown is cheap:
         # if a second caller races in while the first is still draining, let
@@ -431,6 +518,7 @@ class TranscriptionServer:
         if self._server is not None:
             await self._server.wait_closed()
         await self._backend.close()
+        self._release_socket_lock()
         self._started = False
 
     # --- connection handling ---

@@ -241,6 +241,13 @@ def _preflight_listener(args: argparse.Namespace) -> None:
 
     if args.socket_path:
         path = Path(args.socket_path).expanduser()
+        from .server import socket_lock_held
+
+        # The lock is authoritative for servers that take it: connect() cannot
+        # tell a stale socket from a live one with a full backlog (macOS gives
+        # ECONNREFUSED for both).
+        if socket_lock_held(path):
+            raise OSError(errno.EADDRINUSE, f"a server is already running for {path}")
         if path.is_socket():
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
                 probe.settimeout(0.5)
@@ -252,7 +259,9 @@ def _preflight_listener(args: argparse.Namespace) -> None:
                     ) from exc
                 except OSError as exc:
                     if exc.errno in {errno.ECONNREFUSED, errno.ENOENT}:
-                        return  # narrowly proven stale: start() replaces it
+                        # No lock holder (checked above) and nothing accepting:
+                        # stale. start() takes the lock before replacing it.
+                        return
                     if exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
                         raise OSError(
                             errno.EADDRINUSE,
