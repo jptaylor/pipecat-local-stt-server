@@ -330,8 +330,8 @@ A backend is registered in one place and picked up by `--backend`, the
 3. **Optional `abort()`** if the backend owns cleanup that must survive a failed
    start or a hard exit (e.g. a private temp dir): synchronous, idempotent, safe
    while a decode thread still runs, and undone by the next `start()`. A failed
-   start calls it after `close()` when the backend's `start()` had returned; the
-   server may then be retried (a failed start that left work running is
+   start calls it after `close()` when the backend's `start()` had returned,
+   and alone when it had not; the server may then be retried (a failed start that left work running is
    single-use instead, but the backend can go to a new server).
    Optional `idle()` (`IdleAwareBackend`) reports when no decode thread is left;
    the server keeps its lock until then. The full contracts are in

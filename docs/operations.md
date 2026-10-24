@@ -49,9 +49,13 @@ live server whose listen backlog is full is never mistaken for a stale socket.
   opens the file non-blocking and treats anything but a plain file you own as
   "not held" (the real start then refuses it), so a planted FIFO cannot hang it.
 - If a session task ignores cancellation past the shutdown grace, a decode
-  thread is still running on the GPU after its task was cancelled, or
+  thread is still running on the GPU after its task was cancelled,
   `backend.close()` is still running past its bound (the drain timeout, 10 s),
-  the lock stays held until that work finishes (also when the shutdown itself
+  the listener's close has not completed (a connection handler that will not
+  finish keeps it open past its grace), or a startup / readiness step ignored
+  `serve`'s cancel (a stop, or `serve` itself being cancelled), the lock stays
+  held until that work finishes. A cleanup that fails (an orphaned listener
+  whose close raised) keeps it held until the process exits (also when the shutdown itself
   was cancelled, or when the work was left by a failed start: that server then
   stays `stopping` and is single-use, while a failed start that left nothing
   running returns to `new` and may be retried). In-process callers await

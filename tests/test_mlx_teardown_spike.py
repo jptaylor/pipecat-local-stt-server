@@ -221,7 +221,7 @@ async def test_shutdown_force_cancels_past_drain_timeout(monkeypatch):
         await asyncio.wait_for(srv.shutdown(), timeout=3.0)
         elapsed = asyncio.get_running_loop().time() - t0
 
-        # Drain budget is 0.5 s; with the force-cancel + re-gather overhead
+        # Drain budget is 0.5 s; with the force-cancel + drain wait
         # 1.5 s is a generous ceiling. A regression that skipped the
         # force-cancel would hang until the 3 s wait_for expires.
         assert elapsed < 1.5, f"shutdown took {elapsed:.2f}s with hung backend"

@@ -443,9 +443,50 @@ fixed at the definition:
   stopped"; `ConfigError` docstring lists `serve(on_fatal=...)` and the Hub
   validation case via `is_config_error()`.
 
+### Round 7 (review gauntlet)
+
+The round-7 server findings were one class: exits from lock-holding scopes
+that did not fail closed. Fixed together:
+
+- **A failing cleanup keeps its entry.** `_retire` popped the entry in a
+  `finally`, so an orphan bind whose `listener.close()` raised left the
+  listener serving, the ledger empty and the lock released. Now a `then` that
+  raises leaves the entry live, marked stuck, and logs; the lock stays held
+  until the process exits (the CLI's hard exit sees it). Old invariant: "an
+  entry leaves after its cleanup ran"; new: "an entry leaves only after its
+  cleanup SUCCEEDED".
+- **One handoff primitive.** `_hand_off(predecessor, successor, kind)`
+  registers the successor (a future via `_track`, or a plain key: a bound
+  listener, a step token) and only then drops the predecessor. The listener's
+  adopt and close and `_begin_work` go through it; entries are added only by
+  it and `_track` and dropped only by `_end_work`. A `then` given for an
+  already-done future runs at once through `_retire` instead of being dropped.
+- **Every `serve` exit settles a pending step.** Cancelling `serve` itself
+  left the startup / readiness task running outside the ledger while
+  `shutdown()` closed the backend and released the lock. `_abandon_step`
+  (cancel, bounded wait, `adopt` one that outlives it, even if that wait is
+  cancelled) now runs for a stop and, in `serve`'s `finally`, for any other
+  exit; the readiness task is in the ledger from creation (`start()` keeps
+  its own in-flight entry). Matrix test: {startup, readiness} x {stop, cancel}
+  x {prompt, ignores cancellation}, plus a failing readiness step.
+- **The hard exit reads the whole ledger.** `live_work_count` (new, the
+  ledger's size) is what holds the lock and what `serve`'s hard exit reads;
+  `stuck_work_count` is a diagnostic ("entries that outlived their bound").
+  The post-drain sweep that kept the two equal (and skipped non-future
+  entries) is gone. Test: a leftover step token (a non-future entry) still
+  triggers the hard exit.
+- **MLX completeness** (`prefetch --check`): `weights.*` accepted files
+  `mlx_whisper.load_models.load_model` never opens (it reads
+  `weights.safetensors`, else `weights.npz`). A `required` entry may now list
+  alternatives (`a|b`); MLX requires `weights.safetensors|weights.npz`.
+- Docs: operations lock-hold bullet adds the listener close, a stubborn
+  startup / readiness step and a failing cleanup; README `abort()` runs alone
+  when `start()` had not returned; `_CANCEL_GRACE_SECONDS` / `_on_close`
+  comments; test renamed `test_cli_stuck_work_exit_still_reports_the_failure`.
+
 ## Final Results
 
 - All phases and follow-ups complete on `fix/pr14-review-findings`, including
-  the round-2 to round-6 fixes; Ruff format/check clean; full suite 562 passed, 3 skipped,
+  the round-2 to round-7 fixes; Ruff format/check clean; full suite 578 passed, 3 skipped,
   1 failed: the pre-existing, unrelated
   `tests/test_justfile_recipes.py::test_stt_list_prints_socket_in_tilde_form`.

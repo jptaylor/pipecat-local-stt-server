@@ -167,6 +167,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the listener's `wait_closed`, which now lingers past its grace instead of
   being cancelled) is live work from creation; and session / decode tasks
   are registered only in the ledger.
+- The lock fails closed on every exit path: a ledger entry whose own cleanup
+  raises (an orphaned listener whose `close()` failed, still serving) stays
+  live, marked stuck, instead of being dropped and releasing the lock; a
+  `then` cleanup given for an already-finished future runs at once instead of
+  being dropped; the successor-before-predecessor handoff (bound listener to
+  its close) is one primitive. Cancelling `serve` itself now settles a pending
+  startup / readiness step the way a stop does (cancel, bounded wait, keep one
+  that outlives it as live work) instead of leaving it running while the
+  backend closed and the lock was released; the readiness step is live work
+  from creation. The CLI's hard exit reads the whole ledger
+  (`TranscriptionServer.live_work_count`, new) rather than
+  `stuck_work_count`, which is now only a diagnostic, so no entry kind can hold
+  the lock without triggering it.
+- `prefetch --check --backend mlx` counts a snapshot complete only with the
+  files `mlx_whisper` opens (`config.json` and `weights.safetensors` or
+  `weights.npz`); a `weights.*` glob accepted e.g. `weights.txt`.
 - `serve`: when `shutdown()` also fails after `serve` was already failing, the
   first failure is raised (and handed to `on_fatal`); the shutdown failure is
   logged instead of replacing it.
