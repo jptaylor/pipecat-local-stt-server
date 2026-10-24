@@ -320,7 +320,11 @@ A backend is registered in one place and picked up by `--backend`, the
 1. **Module** `stt_server/backends/<name>.py`: a class implementing
    `TranscriptionBackend` (`backend_name`, `model`, `start()`, `open_stream()`,
    `close()`) and a module-level `prefetch_specs(model) -> list[SnapshotSpec]`
-   (`stt_server.snapshot`). Import the optional extra only inside `start()` or
+   (`stt_server.snapshot`). Each `SnapshotSpec.required` entry is a glob
+   (relative to the snapshot root) that must match a file for `prefetch
+   --check` to report it cached; a tuple entry is a set of alternatives, any one
+   of which suffices (see the field docstring in `stt_server/snapshot.py`).
+   Import the optional extra only inside `start()` or
    the lazy model load, never at module load, and re-raise a missing extra as
    `ModuleNotFoundError` with the `uv sync --extra <name> --inexact` hint. Reuse
    `DecodeGuardMixin` (`backends/_thread_util.py`) for MLX/Metal decodes.

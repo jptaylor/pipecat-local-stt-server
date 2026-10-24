@@ -537,7 +537,16 @@ def test_invalid_local_model_is_model_invalid(tmp_path, monkeypatch, capsys, che
 
 
 @pytest.mark.parametrize(
-    "name", ["*.safetensors", "../evil.safetensors", "sub/model.safetensors", "m[1].bin", "", 7]
+    "name",
+    [
+        "*.safetensors",
+        "../evil.safetensors",
+        "sub/model.safetensors",
+        "m[1].bin",
+        "x|config.json",
+        "",
+        7,
+    ],
 )
 def test_kyutai_config_names_must_be_plain_filenames(name):
     from stt_server.backends import kyutai as K
@@ -563,6 +572,89 @@ def test_kyutai_glob_config_never_reads_as_cached(tmp_path, monkeypatch, capsys)
     monkeypatch.setattr(PF, "_snapshot_download", lambda spec, *, local_files_only: str(snap))
     code, events, _ = _run(monkeypatch, capsys, "--backend", "kyutai", "--check", "--json")
     assert code == 0 and events[-1]["cached"] is False
+
+
+def test_kyutai_pipe_name_never_reads_as_cached(tmp_path, monkeypatch, capsys):
+    """Round 8: ``|`` used to be an in-band alternatives delimiter, so a config
+    naming ``model.q8.safetensors|config.json`` passed completeness on
+    ``config.json`` alone while the loader requests the literal name."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "config.json").write_text(
+        json.dumps(
+            {
+                "mimi_name": "mimi.safetensors",
+                "moshi_name": "model.q8.safetensors|config.json",
+                "tokenizer_name": "tokenizer.model",
+            }
+        )
+    )
+    (snap / "mimi.safetensors").write_bytes(b"i")
+    (snap / "tokenizer.model").write_bytes(b"t")
+    monkeypatch.setattr(PF, "_snapshot_download", lambda spec, *, local_files_only: str(snap))
+    code, events, _ = _run(monkeypatch, capsys, "--backend", "kyutai", "--check", "--json")
+    assert code == 0 and events[-1]["cached"] is False
+    code, events, _ = _run(monkeypatch, capsys, "--backend", "kyutai", "--json")
+    assert code == 1 and events[-1]["code"] == "ModelInvalidError"
+
+
+def test_required_string_entry_is_one_literal_glob(tmp_path):
+    """A plain string entry is never split: alternatives are a tuple."""
+    (tmp_path / "config.json").write_text("{}")
+    assert PF._complete(tmp_path, ("x|config.json",)) is False
+    assert PF._complete(tmp_path, (("x", "config.json"),)) is True
+
+
+def _mlx_hub(tmp_path, monkeypatch, weights: str):
+    """A fake hub whose mlx repo holds ``config.json`` + ``weights`` only."""
+    files = {"config.json": b"{}", weights: b"w" * 7}
+
+    def fake(spec, *, local_files_only):
+        snap = tmp_path / "hub" / spec.repo_id.replace("/", "--")
+        if not local_files_only:
+            snap.mkdir(parents=True, exist_ok=True)
+            for name, data in files.items():
+                (snap / name).write_bytes(data)
+        elif not snap.is_dir():
+            raise FileNotFoundError("not cached")
+        return str(snap)
+
+    monkeypatch.setattr(PF, "_snapshot_download", fake)
+    monkeypatch.setattr(
+        PF, "_remote_files", lambda spec: [(n, len(d), f"blob-{n}") for n, d in files.items()]
+    )
+    monkeypatch.setattr(PF, "_repo_cache_dir", lambda repo: tmp_path / "cache")
+
+
+@pytest.mark.parametrize(("weights", "ok"), [("weights.npz", True), ("weights.txt", False)])
+def test_mlx_weight_alternatives_through_hub_check_and_fetch(
+    tmp_path, monkeypatch, capsys, weights, ok
+):
+    """Codex low: the ``weights.safetensors``/``weights.npz`` alternative must
+    hold for every consumer (Hub fetch validation, Hub check), not only a local
+    ``--check``."""
+    _mlx_hub(tmp_path, monkeypatch, weights)
+    code, events, _ = _run(monkeypatch, capsys, "--backend", "mlx", "--json")
+    if ok:
+        assert code == 0 and events[-1]["event"] == "complete"
+    else:
+        assert code == 1 and events[-1]["code"] == "ModelInvalidError"
+    code, events, _ = _run(monkeypatch, capsys, "--backend", "mlx", "--check", "--json")
+    assert code == 0 and events[-1]["cached"] is ok
+
+
+@pytest.mark.parametrize(("weights", "ok"), [("weights.npz", True), ("weights.txt", False)])
+def test_mlx_weight_alternatives_through_local_fetch(tmp_path, monkeypatch, capsys, weights, ok):
+    model = tmp_path / "custom"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    (model / weights).write_bytes(b"w")
+    code, events, _ = _run(monkeypatch, capsys, "--backend", "mlx", "--model", str(model), "--json")
+    if ok:
+        assert code == 0 and events[-1]["event"] == "complete"
+    else:
+        assert code == 1 and events[-1]["code"] == "ModelInvalidError"
+        assert "weights.safetensors or weights.npz" in events[-1]["message"]
 
 
 @pytest.mark.parametrize("config", [b"null", b"[]", b'"x"', b"3"])

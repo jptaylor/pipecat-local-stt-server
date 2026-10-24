@@ -316,6 +316,6 @@ def prefetch_specs(model: str | None) -> list[SnapshotSpec]:
     return [
         SnapshotSpec(
             model or DEFAULT_MLX_MODEL,
-            required=("config.json", "weights.safetensors|weights.npz"),
+            required=("config.json", ("weights.safetensors", "weights.npz")),
         )
     ]

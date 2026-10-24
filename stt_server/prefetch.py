@@ -87,7 +87,8 @@ def _validated(spec: SnapshotSpec, path: str | Path, *, what: str) -> SnapshotSp
     try:
         spec = _resolved(spec, path)
         if not _complete(path, spec.required):
-            raise FileNotFoundError(f"{what} is missing {', '.join(spec.required)}")
+            missing = ", ".join(_describe(entry) for entry in spec.required)
+            raise FileNotFoundError(f"{what} is missing {missing}")
     except Exception as exc:
         mark_model_invalid(exc)
         raise
@@ -193,11 +194,20 @@ def _snapshot_size(path: str | Path) -> int:
     return total
 
 
-def _complete(path: str | Path, required: tuple[str, ...]) -> bool:
-    """Every ``required`` entry matches a file; ``a|b`` matches either."""
+def _alternatives(entry: str | tuple[str, ...]) -> tuple[str, ...]:
+    """A ``required`` entry as its globs: a string is one glob, taken literally."""
+    return (entry,) if isinstance(entry, str) else tuple(entry)
+
+
+def _describe(entry: str | tuple[str, ...]) -> str:
+    return " or ".join(_alternatives(entry))
+
+
+def _complete(path: str | Path, required: tuple[str | tuple[str, ...], ...]) -> bool:
+    """Every ``required`` entry matches a file; a tuple entry needs any one of its globs."""
     names = [str(p.relative_to(path)) for p in Path(path).rglob("*") if p.is_file()]
     return all(
-        any(fnmatch.fnmatch(n, alt) for n in names for alt in entry.split("|"))
+        any(fnmatch.fnmatch(n, alt) for n in names for alt in _alternatives(entry))
         for entry in required
     )
 

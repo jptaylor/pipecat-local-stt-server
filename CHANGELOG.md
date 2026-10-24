@@ -183,6 +183,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `prefetch --check --backend mlx` counts a snapshot complete only with the
   files `mlx_whisper` opens (`config.json` and `weights.safetensors` or
   `weights.npz`); a `weights.*` glob accepted e.g. `weights.txt`.
+  Alternatives in `SnapshotSpec.required` are a tuple entry, not an `a|b`
+  string, and a weight filename read from a Kyutai `config.json` may not
+  contain `|`, so such a name can no longer pass `--check` on another file.
 - `serve`: when `shutdown()` also fails after `serve` was already failing, the
   first failure is raised (and handed to `on_fatal`); the shutdown failure is
   logged instead of replacing it.
