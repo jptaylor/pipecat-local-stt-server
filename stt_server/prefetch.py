@@ -50,7 +50,7 @@ from typing import Any
 # ``SnapshotSpec`` lives in the stdlib-only ``stt_server.snapshot`` (the backends
 # import it from there); re-exported here for existing callers.
 from .snapshot import SnapshotSpec, check_plain_filenames, download_phase, mark_model_invalid
-from .errors import ConfigError
+from .errors import ConfigError, is_config_error
 
 __all__ = ["SnapshotSpec", "check_spec", "fetch_spec", "run_prefetch", "specs_for"]
 
@@ -203,7 +203,11 @@ def _complete(path: str | Path, required: tuple[str, ...]) -> bool:
 
 
 def check_spec(spec: SnapshotSpec) -> dict[str, Any]:
-    """Offline cache probe for one snapshot. ``ImportError`` propagates."""
+    """Offline cache probe for one snapshot.
+
+    ``ImportError`` and a config error (a malformed Hub repo id or revision,
+    ``errors.is_config_error``) propagate, so ``--check`` and a fetch classify
+    bad input the same way; any other probe failure is a cache miss."""
     row: dict[str, Any] = {
         "event": "check",
         "repo": spec.repo_id,
@@ -224,6 +228,11 @@ def check_spec(spec: SnapshotSpec) -> dict[str, Any]:
         except ImportError:
             raise
         except Exception as exc:  # noqa: BLE001 - any miss (incl. incomplete snapshot) = not cached
+            if is_config_error(exc):
+                # A malformed repo id / revision is bad input, not a cache miss:
+                # report ``ConfigError`` exactly as a fetch does.
+                exc._prefetch_repo = spec.repo_id  # type: ignore[attr-defined]
+                raise
             logger.debug("prefetch: %s not cached (%s)", spec.repo_id, exc)
             return row
     try:

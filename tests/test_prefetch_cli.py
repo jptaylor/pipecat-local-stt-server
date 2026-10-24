@@ -338,6 +338,30 @@ def test_missing_huggingface_hub_is_clean_error(monkeypatch, capsys):
     assert events[-1]["event"] == "error" and events[-1]["code"] == "ModuleNotFoundError"
 
 
+@pytest.mark.parametrize("check", [True, False])
+def test_malformed_repo_id_is_config_error_in_check_and_fetch(monkeypatch, capsys, check):
+    """``--check`` must not turn a malformed Hub repo id into ``cached: false``
+    (exit 0): both prefetch paths report ``ConfigError``."""
+
+    class HFValidationError(ValueError):
+        pass
+
+    HFValidationError.__module__ = "huggingface_hub.errors"
+
+    def invalid(spec, *, local_files_only):
+        raise HFValidationError("Repo id must be in the form 'repo_name'")
+
+    monkeypatch.setattr(PF, "_snapshot_download", invalid)
+    monkeypatch.setattr(PF, "_remote_files", lambda spec: [])
+    monkeypatch.setattr(PF, "_repo_cache_dir", lambda repo: Path("/nonexistent"))
+    args = ["--backend", "mlx", "--model", "bad repo", "--json"] + (["--check"] if check else [])
+    code, events, _ = _run(monkeypatch, capsys, *args)
+    assert code == 1
+    assert [e["event"] for e in events if e["event"] in ("check", "summary")] == []
+    assert events[-1]["event"] == "error" and events[-1]["code"] == "ConfigError"
+    assert events[-1]["repo"] == "bad repo"
+
+
 def _complete_local_model(path: Path) -> Path:
     path.mkdir()
     for name, data in _FILES.items():
