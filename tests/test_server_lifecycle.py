@@ -481,6 +481,22 @@ async def test_soft_stop_keeps_an_uncancellable_readiness_step(sock, monkeypatch
         asyncio.get_running_loop().remove_signal_handler(signal.SIGINT)
 
 
+async def test_serve_rejects_on_fatal_without_hard_exit():
+    b = Gated()
+    with pytest.raises(S.ConfigError, match="hard_exit_on_stop"):
+        await asyncio.wait_for(
+            S.serve(
+                b,
+                host="127.0.0.1",
+                port=0,
+                install_signal_handlers=False,
+                on_fatal=lambda exc: None,
+            ),
+            T,
+        )
+    assert b.aborts == 1 and b.starts == 0
+
+
 # --- backend worker thread behind a cancelled decode task ----------------------
 
 

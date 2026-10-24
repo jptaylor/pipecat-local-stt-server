@@ -1748,13 +1748,19 @@ async def serve(
     until they finish. ``os._exit`` skips the caller's exception handlers, so a
     failure propagating at that point is handed to ``on_fatal`` first (the CLI
     passes its own reporter: stderr message and, under ``--supervised``, the
-    ``error`` event); without ``on_fatal`` it is logged.
+    ``error`` event); without ``on_fatal`` it is logged. ``on_fatal`` without
+    ``hard_exit_on_stop=True`` would never be called, so it is rejected
+    (``ConfigError``).
 
     A startup or readiness step that outlives its bounded cancel is handed to
     the server (``TranscriptionServer.adopt``): it keeps the lock until it
     ends and counts in ``stuck_task_count``.
     """
     try:
+        if on_fatal is not None and not hard_exit_on_stop:
+            # It is only ever called right before the hard exit; accepting it
+            # alone would silently drop the caller's error reporting.
+            raise ConfigError("serve(on_fatal=...) requires hard_exit_on_stop=True")
         cfg = ServerConfig(socket_path=socket_path, host=host, port=port, auth_token=auth_token)
     except BaseException:
         # No server will ever ``start()``/``close()`` this backend.
