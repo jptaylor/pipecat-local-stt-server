@@ -27,6 +27,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A stop during startup or warm-up (`serve`, `serve --supervised`) still exits
+  immediately but now removes the Unix socket file it bound (only that inode)
+  and the parakeet/nemotron private temp dir, via
+  `TranscriptionServer.abort_sync()` and an optional backend `abort()` hook.
+- `prefetch --json` progress is consistent: `total_bytes` / `files_total` count
+  only files not yet cached (as in `tts_server prefetch`), `downloaded_bytes`
+  includes partial `.incomplete` blobs from an interrupted run, `files_done` is a
+  real count, and a final progress event reaches the total before `done`.
+- `kyutai` prefetch and `--check` take the weight filenames from the repo's
+  `config.json` (`mimi_name`, `moshi_name`, `tokenizer_name`), so quantized
+  (`.q4`/`.q8`) repos neither fail the completeness check nor download every
+  `*.safetensors`.
+- A listener-preflight error (e.g. `ECONNRESET`/`ECONNABORTED` from the Unix
+  socket probe) is reported as `BackendStartError`, not `ModelDownloadError`. A
+  bare `ConnectionError`/`TimeoutError` is a download failure only when raised
+  during warm-up or a `prefetch` fetch, or when a network library raised it.
+  Error codes are unchanged.
 - `TranscriptionServer.listening_port()` returns `None` for a Unix socket
   instead of a character of its path. `TranscriptionServer` exposes read-only
   `backend` and `config`.

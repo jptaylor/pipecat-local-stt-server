@@ -93,6 +93,23 @@ financials, so the script refuses a `--corpus` under those roots unless
 `--allow-pii-corpus` is passed. Use a synthetic or consented-recording corpus
 and keep it outside the repo.
 
+### Prefetch progress semantics
+
+`python -m stt_server prefetch --json` emits `progress{repo, downloaded_bytes,
+total_bytes, files_done, files_total}` events. They describe only the files this
+run still has to download (the same meaning as `tts_server prefetch`), so a
+supervisor can show `downloaded_bytes / total_bytes` directly:
+
+- `total_bytes` / `files_total`: files not already in the Hugging Face cache when
+  the fetch started (a fully cached repo reports `0` / `0`).
+- `downloaded_bytes`: bytes on disk for those files, including partial
+  `.incomplete` blobs left by an interrupted earlier run.
+- `files_done`: how many of those files have finished.
+- The last `progress` before `done` always has `downloaded_bytes == total_bytes`
+  and `files_done == files_total`.
+
+The `kyutai` backend reads its weight filenames from the repo's `config.json`,
+so quantized (`.q4`/`.q8`) repos fetch only the files the loader will open.
 
 ## Checking server health
 

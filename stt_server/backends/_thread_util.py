@@ -8,6 +8,7 @@ place: a future fix to the bridge cannot silently drift between backends.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from typing import Callable, TypeVar
 
@@ -50,3 +51,59 @@ def _set_result_safe(fut: "asyncio.Future", value) -> None:
 def _set_exception_safe(fut: "asyncio.Future", exc: BaseException) -> None:
     if not fut.done():
         fut.set_exception(exc)
+
+
+class DecodeGuardMixin:
+    """Decode-lock pair, in-flight counter and ``close()`` drain, shared by the
+    MLX/Metal-backed backends (mlx_whisper, parakeet, nemotron, kyutai).
+
+    ``_decode_lock`` (asyncio) serialises decodes across sessions on the event
+    loop; ``_thread_lock`` (threading) serialises the actual MLX/Metal work on
+    the daemon thread. The in-flight counter is incremented by the stream
+    before the daemon thread starts and decremented in a ``finally`` by the
+    stream, so ``close()`` cannot observe "nothing in flight" between
+    ``Thread.start()`` and the thread's first statement.
+
+    Call ``_init_decode_guards()`` from ``__init__``.
+    """
+
+    def _init_decode_guards(self) -> None:
+        self._decode_lock = asyncio.Lock()
+        self._thread_lock = threading.Lock()
+        self._inflight_count = 0
+        self._inflight_cond = threading.Condition()
+
+    def _mark_inflight_start(self) -> None:
+        with self._inflight_cond:
+            self._inflight_count += 1
+
+    def _mark_inflight_end(self) -> None:
+        with self._inflight_cond:
+            self._inflight_count -= 1
+            if self._inflight_count == 0:
+                self._inflight_cond.notify_all()
+
+    def _wait_inflight_drained(self, timeout_s: float) -> bool:
+        with self._inflight_cond:
+            return self._inflight_cond.wait_for(
+                lambda: self._inflight_count == 0,
+                timeout=timeout_s,
+            )
+
+    async def _drain_inflight(
+        self, label: str, log: logging.Logger, timeout_s: float = 3.0
+    ) -> None:
+        """Give an in-flight decode a bounded window to finish flushing Metal
+        work before the process exits (SIGTERM mid-decode can otherwise trip
+        ``-[IOGPUMetalCommandBuffer validate]`` at exit). Logs and returns if
+        the window expires."""
+        drained = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: self._wait_inflight_drained(timeout_s)
+        )
+        if not drained:
+            log.warning(
+                "%s: in-flight decode did not finish within %.1fs; "
+                "Metal assertion possible at process exit",
+                label,
+                timeout_s,
+            )

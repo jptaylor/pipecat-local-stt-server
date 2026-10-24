@@ -127,6 +127,18 @@ def _walk(exc: BaseException) -> Iterator[BaseException]:
         cur = cur.__cause__ or cur.__context__
 
 
+_DOWNLOAD_PHASE_ATTR = "_stt_download_phase"
+
+
+def mark_download_phase(exc: BaseException) -> None:
+    """Tag ``exc`` as raised while a model download was running, so a bare
+    ``ConnectionError``/``TimeoutError`` is classified as ``ModelDownloadError``."""
+    try:
+        setattr(exc, _DOWNLOAD_PHASE_ATTR, True)
+    except AttributeError:  # exotic exception without a __dict__: stay unmarked
+        pass
+
+
 def classify_startup_error(exc: BaseException) -> tuple[str, str]:
     """Map a fatal startup exception to ``(code, human message)``.
 
@@ -144,10 +156,16 @@ def classify_startup_error(exc: BaseException) -> tuple[str, str]:
     for e in chain:
         if isinstance(e, OSError) and e.errno == errno.EACCES:
             return CODE_ACCESS_DENIED, f"permission denied: {e}"
+    # A download failure is recognised by origin, never by errno alone: an
+    # exception from a network library, or a builtin ConnectionError/TimeoutError
+    # raised while a download phase was running (``mark_download_phase``). The
+    # same builtins from the listener preflight (e.g. a UDS probe's ECONNRESET)
+    # are NOT downloads and fall through to ``BackendStartError``.
+    in_download_phase = any(getattr(e, _DOWNLOAD_PHASE_ATTR, False) for e in chain)
     for e in chain:
         module = type(e).__module__ or ""
-        if module.startswith(_DOWNLOAD_MODULE_PREFIXES) or isinstance(
-            e, (ConnectionError, TimeoutError)
+        if module.startswith(_DOWNLOAD_MODULE_PREFIXES) or (
+            in_download_phase and isinstance(e, (ConnectionError, TimeoutError))
         ):
             return CODE_MODEL_DOWNLOAD, f"model download failed: {e}"
     if isinstance(exc, ValueError):

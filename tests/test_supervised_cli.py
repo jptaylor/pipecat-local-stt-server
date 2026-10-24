@@ -151,6 +151,113 @@ def test_supervised_stop_during_blocked_warmup_exits_without_ready(stop_kind):
         _finish(proc)
 
 
+@pytest.mark.parametrize("backend_cls", ["ParakeetBackend", "NemotronBackend"])
+def test_stop_during_blocked_warmup_removes_socket_and_tmpdir(short_home, backend_cls):
+    """The hard exit skips shutdown()/close(); abort_sync must still unlink the
+    bound socket and the backend's private temp dir."""
+    module = backend_cls.replace("Backend", "").lower()
+    sock = short_home / "s" / "stt.sock"
+    script = textwrap.dedent(
+        f"""
+        import asyncio
+        import os
+        import threading
+
+        from stt_server.backends.{module} import {backend_cls}
+        from stt_server.server import serve
+
+        class NoExtra({backend_cls}):
+            async def start(self):
+                return None
+
+        backend = NoExtra()
+
+        async def blocked_ready(server):
+            os.write(2, ("warmup-blocked " + backend._tmpdir + "\\n").encode())
+            await asyncio.to_thread(threading.Event().wait)
+
+        asyncio.run(
+            serve(
+                backend,
+                socket_path={str(sock)!r},
+                ready=blocked_ready,
+                stop_on_stdin_eof=True,
+            )
+        )
+        """
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_env(HOME=str(short_home)),
+    )
+    try:
+        assert proc.stderr is not None
+        tmpdir = None
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([proc.stderr], [], [], 0.25)
+            if ready:
+                line = proc.stderr.readline().decode()
+                if line.startswith("warmup-blocked "):
+                    tmpdir = line.split(" ", 1)[1].strip()
+                    break
+        assert tmpdir, "warm-up did not block in time"
+        assert sock.exists() and Path(tmpdir).is_dir()
+
+        proc.stdin.close()
+        assert proc.wait(timeout=5) == 0
+        assert not sock.exists()
+        assert not Path(tmpdir).exists()
+    finally:
+        _finish(proc)
+        shutil.rmtree(tmpdir or "", ignore_errors=True)
+
+
+def test_abort_sync_never_unlinks_a_socket_it_did_not_bind(short_home):
+    import asyncio
+
+    from stt_server.backend import EchoBackend
+    from stt_server.server import ServerConfig, TranscriptionServer
+
+    sock = short_home / "s" / "stt.sock"
+
+    async def run():
+        srv = TranscriptionServer(EchoBackend(), ServerConfig(socket_path=str(sock)))
+        await srv.start()
+        assert srv._bound_socket_id is not None
+        # Replace our socket with someone else's at the same path.
+        sock.unlink()
+        other = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        other.bind(str(sock))
+        try:
+            srv.abort_sync()
+            assert sock.exists()  # foreign inode: left alone
+        finally:
+            other.close()
+        sock.unlink()
+        await srv.shutdown()
+
+    old_home = os.environ.get("HOME")
+    os.environ["HOME"] = str(short_home)
+    try:
+        asyncio.run(run())
+    finally:
+        if old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = old_home
+
+
+def test_abort_sync_without_bind_is_a_noop():
+    from stt_server.backend import EchoBackend
+    from stt_server.server import ServerConfig, TranscriptionServer
+
+    TranscriptionServer(EchoBackend(), ServerConfig(host="127.0.0.1", port=0)).abort_sync()
+
+
 def test_plain_serve_sigterm_during_slow_startup_exits_promptly():
     """Handlers are installed before ``start()``; a stop must not wait for it."""
     script = textwrap.dedent(
@@ -400,13 +507,77 @@ _HubError.__module__ = "huggingface_hub.errors"
         (OSError(errno.EADDRINUSE, "Address already in use"), "EADDRINUSE"),
         (OSError(errno.EACCES, "Permission denied"), "EACCES"),
         (_HubError("404"), "ModelDownloadError"),
-        (ConnectionResetError("reset"), "ModelDownloadError"),
+        # Bare builtins carry no download origin: not a model download.
+        (ConnectionResetError("reset"), "BackendStartError"),
+        (TimeoutError("timed out"), "BackendStartError"),
+        (OSError(errno.EPERM, "Operation not permitted"), "BackendStartError"),
         (ValueError("V1 only permits loopback binds"), "ConfigError"),
         (RuntimeError("decoder exploded"), "BackendStartError"),
     ],
 )
 def test_classify_startup_error(exc, code):
     assert supervise.classify_startup_error(exc)[0] == code
+
+
+def test_classify_network_library_exception_in_chain_is_download_error():
+    class _HttpxError(Exception):
+        pass
+
+    _HttpxError.__module__ = "httpx"
+    try:
+        try:
+            raise _HttpxError("read timeout")
+        except _HttpxError as inner:
+            raise RuntimeError("model load failed") from inner
+    except RuntimeError as outer:
+        assert supervise.classify_startup_error(outer)[0] == "ModelDownloadError"
+
+
+@pytest.mark.parametrize(
+    "exc", [ConnectionResetError("reset"), ConnectionAbortedError("aborted"), TimeoutError("t")]
+)
+def test_classify_builtin_network_error_in_download_phase_is_download_error(exc):
+    supervise.mark_download_phase(exc)
+    assert supervise.classify_startup_error(exc)[0] == "ModelDownloadError"
+
+
+def test_classify_download_phase_does_not_override_address_errors():
+    exc = OSError(errno.EADDRINUSE, "Address already in use")
+    supervise.mark_download_phase(exc)
+    assert supervise.classify_startup_error(exc)[0] == "EADDRINUSE"
+    exc = OSError(errno.EACCES, "Permission denied")
+    supervise.mark_download_phase(exc)
+    assert supervise.classify_startup_error(exc)[0] == "EACCES"
+
+
+@pytest.mark.parametrize("probe_errno", [errno.ECONNRESET, errno.ECONNABORTED, errno.EPERM])
+def test_supervised_preflight_oserror_is_not_reported_as_download_error(
+    monkeypatch, capsys, probe_errno
+):
+    def broken_preflight(_args):
+        raise OSError(probe_errno, "uds probe failed")
+
+    monkeypatch.setattr(cli, "_preflight_listener", broken_preflight)
+    args = SimpleNamespace(supervised=True, log_level="WARNING")
+    with pytest.raises(SystemExit) as exc:
+        cli._cmd_serve(args)
+    assert exc.value.code == 1
+    event = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert event["event"] == "error" and event["code"] == "BackendStartError"
+    assert "download" not in event["message"]
+
+
+def test_warmup_connection_error_is_reported_as_download_error():
+    import asyncio
+
+    class FailingBackend:
+        async def open_stream(self, *, language=None):
+            raise ConnectionResetError("model host hung up")
+
+    server = SimpleNamespace(backend=FailingBackend())
+    with pytest.raises(ConnectionResetError) as exc:
+        asyncio.run(cli._prepare_ready(server))
+    assert supervise.classify_startup_error(exc.value)[0] == "ModelDownloadError"
 
 
 def test_classify_follows_cause_chain():

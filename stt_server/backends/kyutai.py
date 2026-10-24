@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import AsyncGenerator
 
 from ..backend import TranscriptEvent
-from ._thread_util import run_in_daemon_thread
+from ._thread_util import DecodeGuardMixin, run_in_daemon_thread
 
 logger = logging.getLogger("stt_server.backends.kyutai")
 
@@ -124,7 +124,7 @@ class _KyutaiStream:
         yield TranscriptEvent(kind="completed", text=text)
 
 
-class KyutaiBackend:
+class KyutaiBackend(DecodeGuardMixin):
     """ASR backend backed by Kyutai's streaming STT models via ``moshi_mlx``."""
 
     backend_name = "kyutai"
@@ -135,26 +135,11 @@ class KyutaiBackend:
         # Loaded on the first decode (a ~2.4 GB checkpoint), like parakeet.
         self._loaded: dict | None = None
         self._model_lock = threading.Lock()
-        self._decode_lock = asyncio.Lock()
-        self._thread_lock = threading.Lock()
-        self._inflight_count = 0
-        self._inflight_cond = threading.Condition()
-
-    def _mark_inflight_start(self) -> None:
-        with self._inflight_cond:
-            self._inflight_count += 1
-
-    def _mark_inflight_end(self) -> None:
-        with self._inflight_cond:
-            self._inflight_count -= 1
-            if self._inflight_count == 0:
-                self._inflight_cond.notify_all()
-
-    def _wait_inflight_drained(self, timeout_s: float) -> bool:
-        with self._inflight_cond:
-            return self._inflight_cond.wait_for(
-                lambda: self._inflight_count == 0, timeout=timeout_s
-            )
+        # Decode-lock pair + in-flight counter (see ``DecodeGuardMixin``): the
+        # lock pair is shared across every stream so concurrent sessions truly
+        # serialize on the MLX/Metal side, and the in-flight counter backs the
+        # bounded ``close()`` drain.
+        self._init_decode_guards()
 
     def _get_model(self) -> dict:
         """Load config, Mimi, the LM and the tokenizer once (decode thread)."""
@@ -253,27 +238,38 @@ class KyutaiBackend:
         return _KyutaiStream(language, self._decode_lock, self._thread_lock, self)
 
     async def close(self) -> None:
-        timeout_s = 3.0
-        drained = await asyncio.get_running_loop().run_in_executor(
-            None, lambda: self._wait_inflight_drained(timeout_s)
-        )
-        if not drained:
-            logger.warning(
-                "kyutai: in-flight decode did not finish within %.1fs; "
-                "Metal assertion possible at process exit",
-                timeout_s,
-            )
+        await self._drain_inflight("kyutai", logger)
+
+
+def weight_files(config: dict) -> tuple[str, ...]:
+    """The files ``_get_model`` loads, named by the repo's own ``config.json``.
+
+    Mirrors ``_get_model`` exactly (``moshi_name`` defaults to
+    ``model.safetensors`` and may be a ``.q4``/``.q8`` variant), so prefetch and
+    the completeness check follow quantized repos instead of assuming one name.
+    """
+    for key in ("mimi_name", "tokenizer_name"):
+        if key not in config:
+            raise KeyError(f"config.json has no {key!r}")
+    return (
+        "config.json",
+        config["mimi_name"],
+        config.get("moshi_name", "model.safetensors"),
+        config["tokenizer_name"],
+    )
 
 
 def prefetch_specs(model: str | None) -> list:
     """Snapshots ``python -m stt_server prefetch --backend kyutai`` fetches: the
-    config, Mimi and LM weights and the tokenizer that ``_get_model`` loads."""
+    config, Mimi and LM weights and the tokenizer that ``_get_model`` loads. The
+    weight filenames come from ``config.json`` (see ``weight_files``)."""
     from ..prefetch import SnapshotSpec
 
     return [
         SnapshotSpec(
             model or DEFAULT_KYUTAI_MODEL,
-            allow_patterns=("*.json", "*.safetensors", "*.model"),
-            required=("config.json", "model.safetensors", "mimi*.safetensors", "*.model"),
+            allow_patterns=("config.json",),
+            required=("config.json",),
+            resolve=weight_files,
         )
     ]

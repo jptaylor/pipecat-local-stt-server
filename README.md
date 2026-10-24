@@ -225,12 +225,18 @@ answer is the `cached` field. With `--json` each stdout line is one event:
 | Event | Fields |
 |---|---|
 | `start` | `repo`, `revision`, `kind` |
-| `progress` | `repo`, `downloaded_bytes`, `total_bytes`, `files_done`, `files_total` |
+| `progress` | `repo`, `downloaded_bytes`, `total_bytes`, `files_done`, `files_total` (counts only files not yet cached; see below) |
 | `done` | `repo`, `path`, `size_bytes` |
 | `complete` | `backend`, `model`, `cached`, `size_bytes` |
 | `check` | `repo`, `revision`, `kind`, `required`, `cached`, `path`, `size_bytes` (with `--check`) |
 | `summary` | `backend`, `model`, `cached`, `size_bytes` (with `--check`) |
 | `error` | `code`, `message`, `repo`; exit status 1 |
+
+`progress` counts only what this run must download, as in `tts_server prefetch`:
+`total_bytes` / `files_total` exclude files already in the cache,
+`downloaded_bytes` includes partial blobs from an interrupted run, and the last
+`progress` before `done` has `downloaded_bytes == total_bytes` and
+`files_done == files_total` (all zero when everything was cached).
 
 The schema matches `tts_server prefetch` in
 [pipecat-local-tts-server](https://github.com/vr000m/pipecat-local-tts-server),

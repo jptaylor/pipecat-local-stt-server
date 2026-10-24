@@ -8,6 +8,7 @@ are stubbed.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import sys
 from pathlib import Path
@@ -19,7 +20,9 @@ from stt_server import prefetch as PF
 
 # The files each fake snapshot gets (enough to satisfy every backend's ``required``).
 _FILES = {
-    "config.json": b"{}",
+    # Kyutai's loader reads these names from config.json (moshi_name defaults to
+    # model.safetensors); the other backends ignore the content.
+    "config.json": b'{"mimi_name": "mimi-x@1.safetensors", "tokenizer_name": "tokenizer.model"}',
     "weights.safetensors": b"w" * 100,
     "model.safetensors": b"m" * 200,
     "mimi-x@1.safetensors": b"i" * 50,
@@ -57,7 +60,9 @@ def fake_hub(tmp_path, monkeypatch):
         return str(snap)
 
     monkeypatch.setattr(PF, "_snapshot_download", fake)
-    monkeypatch.setattr(PF, "_remote_files", lambda spec: [(n, len(d)) for n, d in _FILES.items()])
+    monkeypatch.setattr(
+        PF, "_remote_files", lambda spec: [(n, len(d), f"blob-{n}") for n, d in _FILES.items()]
+    )
     monkeypatch.setattr(
         PF, "_repo_cache_dir", lambda repo: tmp_path / "cache" / repo.replace("/", "--")
     )
@@ -125,6 +130,96 @@ def test_check_incomplete_snapshot_is_not_cached(fake_hub, tmp_path, monkeypatch
     assert code == 0 and events[-1]["cached"] is False
 
 
+def _quantized_kyutai_hub(tmp_path, monkeypatch):
+    """A fake hub whose Kyutai repo names a q4 LM and also holds other weights."""
+    config = (
+        b'{"mimi_name": "mimi-x.safetensors", "moshi_name": "model.q4.safetensors",'
+        b' "tokenizer_name": "tok.model"}'
+    )
+    remote = {
+        "config.json": config,
+        "mimi-x.safetensors": b"i" * 50,
+        "model.q4.safetensors": b"q" * 40,
+        "model.q8.safetensors": b"8" * 80,
+        "model.safetensors": b"m" * 200,
+        "tok.model": b"t" * 10,
+    }
+    snap = tmp_path / "hub" / "kyutai-q4"
+    downloaded: list[tuple[str, ...]] = []
+
+    def fake(spec, *, local_files_only):
+        if local_files_only:
+            if not snap.exists():
+                raise FileNotFoundError("not cached")
+            return str(snap)
+        downloaded.append(spec.allow_patterns)
+        snap.mkdir(parents=True, exist_ok=True)
+        for name, data in remote.items():
+            if any(fnmatch.fnmatch(name, p) for p in spec.allow_patterns or ("*",)):
+                (snap / name).write_bytes(data)
+        return str(snap)
+
+    monkeypatch.setattr(PF, "_snapshot_download", fake)
+    monkeypatch.setattr(
+        PF,
+        "_remote_files",
+        lambda spec: [
+            (n, len(d), f"blob-{n}")
+            for n, d in remote.items()
+            if any(fnmatch.fnmatch(n, p) for p in spec.allow_patterns or ("*",))
+        ],
+    )
+    monkeypatch.setattr(PF, "_repo_cache_dir", lambda repo: tmp_path / "cache" / "kyutai-q4")
+    return snap, downloaded
+
+
+def test_kyutai_prefetch_follows_quantized_moshi_name(tmp_path, monkeypatch, capsys):
+    snap, downloaded = _quantized_kyutai_hub(tmp_path, monkeypatch)
+    code, events, _ = _run(
+        monkeypatch, capsys, "--backend", "kyutai", "--model", "kyutai/q4", "--json"
+    )
+    assert code == 0, events
+    # config first, then exactly the files config.json names -- not every *.safetensors.
+    assert downloaded[0] == ("config.json",)
+    assert set(downloaded[1]) == {
+        "config.json",
+        "mimi-x.safetensors",
+        "model.q4.safetensors",
+        "tok.model",
+    }
+    assert sorted(p.name for p in snap.iterdir()) == sorted(downloaded[1])
+    assert not (snap / "model.safetensors").exists()
+    assert not (snap / "model.q8.safetensors").exists()
+    progress = [e for e in events if e["event"] == "progress"]
+    assert progress[-1]["files_total"] == 4  # config + mimi + q4 + tokenizer, not all six
+
+    code, events, _ = _run(
+        monkeypatch, capsys, "--backend", "kyutai", "--model", "kyutai/q4", "--check", "--json"
+    )
+    assert code == 0 and events[-1]["cached"] is True
+
+
+def test_kyutai_check_uses_named_weights_not_model_safetensors(tmp_path, monkeypatch, capsys):
+    snap, _ = _quantized_kyutai_hub(tmp_path, monkeypatch)
+    snap.mkdir(parents=True)
+    (snap / "config.json").write_bytes(
+        b'{"mimi_name": "mimi-x.safetensors", "moshi_name": "model.q4.safetensors",'
+        b' "tokenizer_name": "tok.model"}'
+    )
+    for name in ("mimi-x.safetensors", "tok.model", "model.safetensors"):
+        (snap / name).write_bytes(b"x")
+    # model.safetensors is present but the config names the q4 file, which is not.
+    code, events, _ = _run(
+        monkeypatch, capsys, "--backend", "kyutai", "--model", "kyutai/q4", "--check", "--json"
+    )
+    assert code == 0 and events[-1]["cached"] is False
+    (snap / "model.q4.safetensors").write_bytes(b"x")
+    code, events, _ = _run(
+        monkeypatch, capsys, "--backend", "kyutai", "--model", "kyutai/q4", "--check", "--json"
+    )
+    assert events[-1]["cached"] is True
+
+
 def test_check_echo_is_always_cached(monkeypatch, capsys):
     code, events, _ = _run(monkeypatch, capsys, "--backend", "echo", "--check", "--json")
     assert code == 0
@@ -146,6 +241,61 @@ def test_fetch_json_event_order(fake_hub, monkeypatch, capsys):
     assert events[-1]["backend"] == "parakeet" and events[-1]["cached"] is True
 
 
+def test_fetch_progress_counts_only_uncached_and_reaches_total(tmp_path, monkeypatch, capsys):
+    """Already-cached blobs are excluded from total/files_total (TTS semantics);
+    a partial .incomplete blob counts toward downloaded; the last progress event
+    before ``done`` is complete."""
+    monkeypatch.setattr(PF, "_PROGRESS_INTERVAL_S", 0.01)
+    cache = tmp_path / "cache" / "mlx-community--parakeet-tdt-0.6b-v3"
+    blobs = cache / "blobs"
+    blobs.mkdir(parents=True)
+    (blobs / "blob-config.json").write_bytes(b"{}")  # already cached
+    (blobs / "blob-model.safetensors.incomplete").write_bytes(b"m" * 80)  # interrupted
+    monkeypatch.setattr(PF, "_repo_cache_dir", lambda repo: cache)
+    monkeypatch.setattr(
+        PF,
+        "_remote_files",
+        lambda spec: [
+            ("config.json", 2, "blob-config.json"),
+            ("model.safetensors", 200, "blob-model.safetensors"),
+        ],
+    )
+
+    def fake(spec, *, local_files_only):
+        # Let the reporter observe the partial blob, then finish the download.
+        import time
+
+        time.sleep(0.1)
+        (blobs / "blob-model.safetensors.incomplete").rename(blobs / "blob-model.safetensors")
+        (blobs / "blob-model.safetensors").write_bytes(b"m" * 200)
+        snap = tmp_path / "hub" / "p"
+        snap.mkdir(parents=True, exist_ok=True)
+        for name in ("config.json", "model.safetensors"):
+            (snap / name).write_bytes(b"x")
+        return str(snap)
+
+    monkeypatch.setattr(PF, "_snapshot_download", fake)
+    code, events, _ = _run(monkeypatch, capsys, "--backend", "parakeet", "--json")
+    assert code == 0
+    progress = [e for e in events if e["event"] == "progress"]
+    assert progress, events
+    assert all(e["total_bytes"] == 200 and e["files_total"] == 1 for e in progress)
+    assert progress[0]["downloaded_bytes"] == 80 and progress[0]["files_done"] == 0
+    last = progress[-1]
+    assert last["downloaded_bytes"] == last["total_bytes"] == 200
+    assert last["files_done"] == last["files_total"] == 1
+    assert [e["event"] for e in events[-3:]] == ["progress", "done", "complete"]
+
+
+def test_fetch_progress_unknown_blob_ids_still_reach_total(fake_hub, monkeypatch, capsys):
+    monkeypatch.setattr(PF, "_remote_files", lambda spec: [("model.safetensors", 200)])
+    code, events, _ = _run(monkeypatch, capsys, "--backend", "parakeet", "--json")
+    assert code == 0
+    last = [e for e in events if e["event"] == "progress"][-1]
+    assert last["downloaded_bytes"] == last["total_bytes"] == 200
+    assert last["files_done"] == last["files_total"] == 1
+
+
 def test_fetch_failure_is_error_event(monkeypatch, capsys):
     class _HubError(Exception):
         pass
@@ -163,6 +313,19 @@ def test_fetch_failure_is_error_event(monkeypatch, capsys):
     err = events[-1]
     assert err["event"] == "error" and err["code"] == "ModelDownloadError"
     assert err["repo"] == "mlx-community/whisper-large-v3-turbo"
+
+
+def test_fetch_builtin_connection_error_is_download_error(monkeypatch, capsys):
+    """A bare ConnectionError during a fetch is a download failure (phase-tagged)."""
+
+    def reset(spec, *, local_files_only):
+        raise ConnectionResetError("peer reset")
+
+    monkeypatch.setattr(PF, "_snapshot_download", reset)
+    monkeypatch.setattr(PF, "_remote_files", lambda spec: [])
+    monkeypatch.setattr(PF, "_repo_cache_dir", lambda repo: Path("/nonexistent"))
+    code, events, _ = _run(monkeypatch, capsys, "--backend", "mlx", "--json")
+    assert code == 1 and events[-1]["code"] == "ModelDownloadError"
 
 
 def test_missing_huggingface_hub_is_clean_error(monkeypatch, capsys):

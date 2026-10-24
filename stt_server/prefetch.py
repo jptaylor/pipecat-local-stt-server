@@ -15,7 +15,13 @@ JSON events (one object per stdout line; the same schema as
 
 - fetch: ``start{repo,revision,kind}`` -> ``progress{repo,downloaded_bytes,
   total_bytes,files_done,files_total}``* -> ``done{repo,path,size_bytes}`` per
-  snapshot, then ``complete{backend,model,cached,size_bytes}``;
+  snapshot, then ``complete{backend,model,cached,size_bytes}``. Progress counts
+  only what this run has to download (files already in the cache are excluded,
+  like ``tts_server prefetch``): ``total_bytes``/``files_total`` are the
+  not-yet-cached files, ``downloaded_bytes`` includes partial ``.incomplete``
+  blobs of an interrupted earlier run, and a last progress event with
+  ``downloaded_bytes == total_bytes`` and ``files_done == files_total`` is
+  emitted before ``done``;
 - ``--check``: ``check{repo,revision,kind,required,cached,path,size_bytes}`` per
   snapshot, then ``summary{backend,model,cached,size_bytes}``;
 - failure: ``error{code,message,repo}`` and exit status 1.
@@ -32,6 +38,7 @@ from __future__ import annotations
 import contextlib
 import fnmatch
 import importlib
+import json
 import logging
 import os
 import sys
@@ -62,6 +69,24 @@ class SnapshotSpec:
     #: Set only for an explicit local model reference. It bypasses Hub calls but
     #: still uses this backend-owned spec's ``required`` completeness patterns.
     local_path: str | None = None
+    #: For repos whose weight filenames live in their own ``config.json`` (Kyutai:
+    #: ``moshi_name`` may be a ``.q4``/``.q8`` variant). Called with the parsed
+    #: config, it returns the exact filenames to fetch and require, replacing
+    #: ``allow_patterns``/``required``. ``config.json`` is fetched first.
+    resolve: Callable[[dict], tuple[str, ...]] | None = None
+
+
+def _resolved(spec: SnapshotSpec, path: str | Path) -> SnapshotSpec:
+    """``spec`` with its filenames taken from the snapshot's ``config.json``.
+
+    Raises ``FileNotFoundError``/``ValueError``/``KeyError`` when the config is
+    missing or does not name what the loader needs.
+    """
+    if spec.resolve is None:
+        return spec
+    config = json.loads((Path(path) / "config.json").read_text())
+    names = tuple(spec.resolve(config))
+    return replace(spec, allow_patterns=names, required=names, resolve=None)
 
 
 def is_local_model(model: str) -> bool:
@@ -112,8 +137,12 @@ def _snapshot_download(spec: SnapshotSpec, *, local_files_only: bool) -> str:
     )
 
 
-def _remote_files(spec: SnapshotSpec) -> list[tuple[str, int]]:
-    """``(path, size)`` of the files the snapshot will hold (for progress totals)."""
+def _remote_files(spec: SnapshotSpec) -> list[tuple[str, int, str | None]]:
+    """``(path, size, blob_id)`` of the files the snapshot will hold (for progress).
+
+    ``blob_id`` is the file's name under the cache's ``blobs/`` dir (the LFS
+    sha256, else the git blob id), or ``None`` when the hub did not report one.
+    """
     from huggingface_hub import HfApi  # type: ignore
 
     files = []
@@ -122,33 +151,29 @@ def _remote_files(spec: SnapshotSpec) -> list[tuple[str, int]]:
         if size is None:
             continue  # a folder
         lfs = getattr(entry, "lfs", None)
-        size = getattr(lfs, "size", None) or size
+        size = _lfs_field(lfs, "size") or size
+        blob_id = _lfs_field(lfs, "sha256") or getattr(entry, "blob_id", None)
         if spec.allow_patterns and not any(
             fnmatch.fnmatch(entry.path, p) for p in spec.allow_patterns
         ):
             continue
-        files.append((entry.path, int(size)))
+        files.append((entry.path, int(size), blob_id))
     return files
+
+
+def _lfs_field(lfs: Any, name: str) -> Any:
+    """``lfs.<name>`` for both the object and the TypedDict forms of ``BlobLfsInfo``."""
+    if lfs is None:
+        return None
+    if isinstance(lfs, dict):
+        return lfs.get(name)
+    return getattr(lfs, name, None)
 
 
 def _repo_cache_dir(repo_id: str) -> Path:
     from huggingface_hub import constants  # type: ignore
 
     return Path(constants.HF_HUB_CACHE) / ("models--" + repo_id.replace("/", "--"))
-
-
-def _dir_bytes(path: Path) -> int:
-    """Bytes of the regular files under ``path`` (blobs, including ``.incomplete``)."""
-    total = 0
-    if not path.exists():
-        return 0
-    for p in path.rglob("*"):
-        try:
-            if p.is_file() and not p.is_symlink():
-                total += p.stat().st_size
-        except OSError:
-            continue
-    return total
 
 
 def _snapshot_size(path: str | Path) -> int:
@@ -195,6 +220,11 @@ def check_spec(spec: SnapshotSpec) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001 - any miss (incl. incomplete snapshot) = not cached
             logger.debug("prefetch: %s not cached (%s)", spec.repo_id, exc)
             return row
+    try:
+        spec = _resolved(spec, path)
+    except (OSError, ValueError, KeyError) as exc:  # no/odd config.json = incomplete snapshot
+        logger.debug("prefetch: %s config unreadable (%s)", spec.repo_id, exc)
+        return row
     if not _complete(path, spec.required):
         return row
     row.update(cached=True, path=path, size_bytes=_snapshot_size(path))
@@ -209,6 +239,7 @@ def fetch_spec(spec: SnapshotSpec, emit: Callable[[dict], None] | None) -> dict[
         path = spec.local_path
         if not Path(path).is_dir():
             raise FileNotFoundError(f"local model directory does not exist: {path}")
+        spec = _resolved(spec, path)
         if not _complete(path, spec.required):
             raise FileNotFoundError(f"{path}: local model is missing {', '.join(spec.required)}")
         result = {
@@ -220,27 +251,51 @@ def fetch_spec(spec: SnapshotSpec, emit: Callable[[dict], None] | None) -> dict[
         if emit is not None:
             emit(result)
         return result
+    if spec.resolve is not None:
+        # Fetch the (tiny) config first to learn which weight files this repo
+        # names, then fetch exactly those.
+        config_only = replace(spec, allow_patterns=("config.json",), required=(), resolve=None)
+        spec = _resolved(spec, _snapshot_download(config_only, local_files_only=False))
     reporter: threading.Thread | None = None
     done = threading.Event()
     if emit is not None:
-        files = _remote_files(spec)
-        total = sum(size for _, size in files)
         blobs = _repo_cache_dir(spec.repo_id) / "blobs"
-        baseline = _dir_bytes(blobs)
+        # Only files not yet in the cache count: a finished blob is named by its
+        # id, a partial one ``<id>.incomplete``.
+        pending = [
+            (int(f[1]), f[2] if len(f) > 2 else None)
+            for f in _remote_files(spec)
+            if not ((f[2] if len(f) > 2 else None) and (blobs / f[2]).is_file())
+        ]
+        total = sum(size for size, _ in pending)
+        files_total = len(pending)
+
+        def measure() -> tuple[int, int]:
+            got = n_done = 0
+            for size, blob_id in pending:
+                if blob_id is None:
+                    continue  # unknown blob: counted only by the final event
+                if (blobs / blob_id).is_file():
+                    got += size
+                    n_done += 1
+                    continue
+                with contextlib.suppress(OSError):
+                    got += min(size, (blobs / f"{blob_id}.incomplete").stat().st_size)
+            return got, n_done
+
+        def progress(got: int, n_done: int) -> dict:
+            return {
+                "event": "progress",
+                "repo": spec.repo_id,
+                "downloaded_bytes": got,
+                "total_bytes": total,
+                "files_done": n_done,
+                "files_total": files_total,
+            }
 
         def report() -> None:
             while not done.wait(_PROGRESS_INTERVAL_S):
-                grown = _dir_bytes(blobs) - baseline
-                emit(
-                    {
-                        "event": "progress",
-                        "repo": spec.repo_id,
-                        "downloaded_bytes": max(0, min(grown, total)),
-                        "total_bytes": total,
-                        "files_done": 0,
-                        "files_total": len(files),
-                    }
-                )
+                emit(progress(*measure()))
 
         reporter = threading.Thread(target=report, name="prefetch-progress", daemon=True)
         reporter.start()
@@ -252,6 +307,8 @@ def fetch_spec(spec: SnapshotSpec, emit: Callable[[dict], None] | None) -> dict[
             reporter.join(timeout=1)
     if not _complete(path, spec.required):
         raise FileNotFoundError(f"{spec.repo_id}: snapshot is missing {', '.join(spec.required)}")
+    if emit is not None:
+        emit(progress(total, files_total))  # the download finished: report 100%
     result = {
         "event": "done",
         "repo": spec.repo_id,
@@ -333,6 +390,9 @@ def _run_fetch(backend: str, model: str | None, specs: list[SnapshotSpec], emit)
             raise
         except Exception as exc:
             exc._prefetch_repo = spec.repo_id  # type: ignore[attr-defined]
+            from . import supervise
+
+            supervise.mark_download_phase(exc)  # a fetch failure is a download failure
             raise
     if emit is not None:
         emit(

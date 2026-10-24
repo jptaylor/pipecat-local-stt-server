@@ -256,6 +256,9 @@ class TranscriptionServer:
         self._active_decodes: set[asyncio.Task] = set()
         self._shutdown_event = asyncio.Event()
         self._started = False
+        # (st_dev, st_ino) of the Unix socket file THIS process bound, recorded
+        # right after bind so ``abort_sync`` only ever unlinks our own inode.
+        self._bound_socket_id: tuple[int, int] | None = None
 
     # --- lifecycle ---
     async def start(self) -> None:
@@ -288,6 +291,12 @@ class TranscriptionServer:
                 )
             finally:
                 os.umask(prior_umask)
+            try:
+                st = os.stat(verified_socket)
+                if _stat.S_ISSOCK(st.st_mode):
+                    self._bound_socket_id = (st.st_dev, st.st_ino)
+            except OSError:
+                pass
             if self._config.unix_socket_mode is not None:
                 try:
                     os.chmod(verified_socket, self._config.unix_socket_mode)
@@ -349,6 +358,33 @@ class TranscriptionServer:
     async def wait_closed(self) -> None:
         if self._server is not None:
             await self._server.wait_closed()
+
+    def abort_sync(self) -> None:
+        """Best-effort, synchronous cleanup for a hard process exit.
+
+        Used by ``serve`` when a stop arrives while startup/warm-up is still
+        running and the process must ``os._exit`` (model-load threads cannot be
+        cancelled), which skips ``shutdown()`` and ``backend.close()``. Removes
+        the Unix socket file only if it is still the inode this process bound
+        (never a socket someone else created at the same path), and calls the
+        backend's optional ``abort()`` hook (cheap, non-blocking: e.g. removing
+        a private temp dir -- no thread joins, no Metal drain).
+        """
+        bound = self._bound_socket_id
+        if bound is not None and self._config.socket_path:
+            path = str(self._config.socket_path)
+            try:
+                st = os.lstat(path)
+                if _stat.S_ISSOCK(st.st_mode) and (st.st_dev, st.st_ino) == bound:
+                    os.unlink(path)
+            except OSError:
+                pass
+        abort = getattr(self._backend, "abort", None)
+        if callable(abort):
+            try:
+                abort()
+            except Exception:  # noqa: BLE001 -- best-effort on the way out
+                logger.exception("stt_server: backend abort failed")
 
     async def shutdown(self) -> None:
         """Stop accepting new connections and drain active sessions.
@@ -1095,6 +1131,7 @@ async def serve(
 
     def _hard_exit(stage: str) -> None:
         logger.warning("stt_server: stop requested during %s; exiting", stage)
+        server.abort_sync()
         logging.shutdown()
         os._exit(0)
 

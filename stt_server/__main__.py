@@ -29,20 +29,18 @@ import sys
 from pathlib import Path
 
 from .backend import EchoBackend
+
+# Whisper repo default for ``--backend mlx``: single definition in
+# ``backends/__init__.py`` (stdlib-only, so this stays lean). ``parakeet``'s
+# default lives in ``backends/parakeet.py`` and is imported lazily (it would
+# otherwise pull the parakeet module at every launch).
+from .backends import DEFAULT_MLX_MODEL as _DEFAULT_MLX_MODEL
 from .env import env_first
 from .server import serve
 
 # ``TranscriptionClient`` and ``protocol`` are imported lazily inside the
 # status-subcommand helpers so the serve path (run at every launchd startup)
 # doesn't pay for ``websockets.asyncio.client`` it never uses.
-
-
-# Whisper repo default for ``--backend mlx``. Kept as a module constant so the
-# backend-aware ``--model`` resolution and the "model unset" sentinel agree on
-# one value. ``parakeet``'s default lives in ``backends/parakeet.py`` and is
-# imported lazily (it would otherwise pull the parakeet module at every
-# launch, defeating the lean-base invariant).
-_DEFAULT_MLX_MODEL = "mlx-community/whisper-large-v3-turbo"
 
 
 def _make_backend(name: str, model: str):
@@ -284,8 +282,18 @@ async def _warm(backend) -> None:
 
 
 async def _prepare_ready(server) -> None:
-    """Warm the backend before the supervised ready event is published."""
-    await _warm(server.backend)
+    """Warm the backend before the supervised ready event is published.
+
+    Warm-up is where the lazy model load (and so any first download) happens, so
+    a failure here is tagged as the download phase for ``classify_startup_error``.
+    """
+    from .supervise import mark_download_phase
+
+    try:
+        await _warm(server.backend)
+    except Exception as exc:
+        mark_download_phase(exc)
+        raise
 
 
 def _emit_ready(server) -> None:
