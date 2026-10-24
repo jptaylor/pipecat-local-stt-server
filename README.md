@@ -39,7 +39,11 @@ monorepo. BSD-2-Clause.
   `kyutai` extra — `uv sync --extra kyutai`; default model
   `kyutai/stt-1b-en_fr-mlx`, English and French, CC-BY-4.0). Decodes in memory
   through `moshi_mlx`. The extra pins an older MLX stack and is declared
-  conflicting with the other MLX extras, so install it on its own.
+  conflicting with the other MLX extras, so install it on its own. It needs
+  Python 3.12 (`moshi_mlx` pins `sentencepiece==0.2.0`, which has no 3.13 wheel;
+  elsewhere it builds from source and needs `cmake`), and it is not wired into
+  the LaunchAgent tooling (`install_stt_agent.sh`, `just stt-*`): run it with
+  `serve --backend kyutai`, e.g. under `--supervised`.
 
 ## Running the server
 

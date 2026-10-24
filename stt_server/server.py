@@ -1109,14 +1109,15 @@ async def serve(
 
         watch_stdin_eof(loop, _request_stop)
     try:
-        if stop_on_stdin_eof:
-            start_task = asyncio.ensure_future(server.start())
-            await asyncio.wait({start_task, stop}, return_when=asyncio.FIRST_COMPLETED)
-            if stop.done() and not start_task.done():
-                _hard_exit("startup")
-            await start_task
-        else:
-            await server.start()
+        # Race startup against stop in every mode: the signal handlers above are
+        # installed before ``start()``, so awaiting it bare would defer a
+        # SIGTERM/SIGINT until the backend import finished (``main`` installed
+        # them after ``start()``, leaving the default terminate-now action).
+        start_task = asyncio.ensure_future(server.start())
+        await asyncio.wait({start_task, stop}, return_when=asyncio.FIRST_COMPLETED)
+        if stop.done() and not start_task.done():
+            _hard_exit("startup")
+        await start_task
 
         if stop.done():
             return

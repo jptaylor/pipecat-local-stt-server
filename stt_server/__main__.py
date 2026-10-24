@@ -323,7 +323,14 @@ def _cmd_serve(args: argparse.Namespace) -> None:
 
     with supervise.json_channel():
         try:
-            _preflight_listener(args)
+            try:
+                _preflight_listener(args)
+            except OSError as exc:
+                # Same one-line stderr message and exit 1 as a bind failure in
+                # ``_run_serve`` (not the "fatal error" traceback reserved for
+                # unexpected exceptions); the handler below adds the event.
+                print(f"stt_server: {exc}", file=sys.stderr)
+                raise SystemExit(1) from exc
             _run_serve(
                 args,
                 ready=_prepare_ready,

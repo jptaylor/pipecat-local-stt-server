@@ -20,14 +20,15 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from stt_server import supervise
 from stt_server import __main__ as cli
+from stt_server import supervise
 
 
 def _env(**extra: str) -> dict[str, str]:
@@ -150,6 +151,45 @@ def test_supervised_stop_during_blocked_warmup_exits_without_ready(stop_kind):
         _finish(proc)
 
 
+def test_plain_serve_sigterm_during_slow_startup_exits_promptly():
+    """Handlers are installed before ``start()``; a stop must not wait for it."""
+    script = textwrap.dedent(
+        """
+        import asyncio
+        import os
+
+        from stt_server.backend import EchoBackend
+        from stt_server.server import serve
+
+        class SlowStart(EchoBackend):
+            async def start(self):
+                os.write(2, b"starting\\n")
+                await asyncio.sleep(60)
+
+        asyncio.run(serve(SlowStart(), host="127.0.0.1", port=0))
+        """
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_env(),
+    )
+    try:
+        assert proc.stderr is not None
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([proc.stderr], [], [], 0.25)
+            if ready and proc.stderr.readline() == b"starting\n":
+                break
+        else:
+            raise AssertionError("startup did not begin in time")
+        proc.terminate()
+        assert proc.wait(timeout=5) == 0
+    finally:
+        _finish(proc)
+
+
 @pytest.fixture
 def short_home():
     """A private, short $HOME so the socket-dir ancestor walk passes and the
@@ -185,9 +225,12 @@ def test_live_unix_socket_reports_eaddrinuse(short_home):
         try:
             event = _read_event(second)
             assert second.wait(timeout=15) == 1
+            err = second.stderr.read().decode()
         finally:
             _finish(second)
         assert event["event"] == "error" and event["code"] == "EADDRINUSE"
+        # An expected failure is a one-line message, not a "fatal error" traceback.
+        assert "Traceback" not in err and "stt_server: " in err
         # The first server still owns its socket (it was not replaced).
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
             probe.connect(str(sock))
@@ -374,6 +417,34 @@ def test_classify_follows_cause_chain():
             raise RuntimeError("bind failed") from inner
     except RuntimeError as outer:
         assert supervise.classify_startup_error(outer)[0] == "EADDRINUSE"
+
+
+def test_stdin_watch_treats_nonblocking_empty_pipe_as_not_eof(monkeypatch):
+    r, w = os.pipe()
+    os.set_blocking(r, False)  # a parent that left the shared pipe non-blocking
+
+    class FakeStdin:
+        def fileno(self):
+            return r
+
+    class Loop:
+        def call_soon_threadsafe(self, callback):
+            callback()
+
+    fired = threading.Event()
+    monkeypatch.setattr(sys, "stdin", FakeStdin())
+    try:
+        supervise.watch_stdin_eof(Loop(), fired.set)
+        assert not fired.wait(0.5)  # nothing to read yet is not EOF
+        os.write(w, b"ignored")
+        assert not fired.wait(0.3)  # data is discarded, still not EOF
+        os.close(w)
+        w = -1
+        assert fired.wait(5)  # hang-up is EOF
+    finally:
+        if w != -1:
+            os.close(w)
+        os.close(r)
 
 
 def test_json_channel_routes_prints_to_stderr(capsys):

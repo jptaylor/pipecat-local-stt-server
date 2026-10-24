@@ -26,6 +26,7 @@ import errno
 import json
 import logging
 import os
+import select
 import sys
 import threading
 from collections.abc import Callable, Iterator
@@ -93,6 +94,15 @@ def watch_stdin_eof(loop: Any, on_eof: Callable[[], None]) -> None:
                 chunk = os.read(fd, 4096)
             except InterruptedError:
                 continue
+            except BlockingIOError:
+                # A non-blocking inherited pipe with nothing to read is not EOF:
+                # wait for data or hang-up rather than stopping the server.
+                try:
+                    select.select([fd], [], [])
+                except (OSError, ValueError):
+                    chunk = b""
+                else:
+                    continue
             except OSError:
                 chunk = b""
             if not chunk:
