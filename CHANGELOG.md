@@ -189,11 +189,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   string, and a weight filename read from a Kyutai `config.json` may not
   contain `|`, so such a name can no longer pass `--check` on another file.
 - `serve` uses only `TranscriptionServer`'s public API, so an embedder can
-  write the same loop: `adopt(task, stuck=False, kind="readiness")` registers
-  a step as live work from creation, and `live_work_reasons` (new) names what
-  is live. Which signal to read (`wait_stopped()` to wait; `live_work_count`
-  only after `shutdown()`; `stuck_work_count` diagnostic) is documented once,
-  in the class docstring. Its two hard exits are one routine. A cancel of
+  write the same loop: `adopt(task, label="...")` registers a step as live
+  work (`abandoned=True` for one you stopped waiting for: marked stuck, its
+  failure logged, at once if it already failed), and `live_work_reasons` (new)
+  names what is live. `adopt()` is valid only while `starting`, `running` or
+  `stopping`; in `new` or `stopped` (no lock held) it raises `RuntimeError`,
+  so it can no longer make `shutdown()` fail before `start()` or run work
+  after the lock is released. Which signal to read (`wait_stopped()` to wait;
+  `live_work_count` only after `shutdown()`; `stuck_work_count` diagnostic;
+  `wait_closed()` the listener only) is documented once, in the class
+  docstring. Its two hard exits are one routine. A cancel of
   `serve` landing during a stop's bounded wait on a startup / readiness step
   no longer starts a second full drain-timeout wait.
 - `serve`: when `shutdown()` also fails after `serve` was already failing, the

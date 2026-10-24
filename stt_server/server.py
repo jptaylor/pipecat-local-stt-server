@@ -414,9 +414,9 @@ _TRANSITIONS: dict[_State, frozenset[_State]] = {
 # only place that does, and it refuses while any live work remains.
 _UNLOCKED_STATES = frozenset({_State.NEW, _State.STOPPED})
 
-# The kinds a caller may hand the server through ``adopt``. The server's own
-# kinds are not adoptable: ``session`` entries are cancelled by the drain.
-_ADOPTABLE_KINDS = frozenset({"adopted", "readiness"})
+# ``adopt`` is valid only while a lock is held or being released (it adds
+# live work, which must never exist where nothing holds the lock).
+_ADOPTABLE_STATES = frozenset({_State.STARTING, _State.RUNNING, _State.STOPPING})
 
 # How ``_live_reasons`` names each kind of live work.
 _WORK_LABELS = {
@@ -426,8 +426,7 @@ _WORK_LABELS = {
     "close": "backend close",
     "bind": "listener bind",
     "listener-close": "listener close",
-    "adopted": "adopted steps",
-    "readiness": "readiness steps",
+    "adopted": "adopted",
     "thread": "backend worker thread",
 }
 
@@ -439,11 +438,13 @@ class _Work:
     ``stuck_work_count``), and the cleanup that must run when it completes,
     before it leaves the ledger (``then``: it registers any successor work
     first, via ``_hand_off``, so the lock never falls between). A cleanup that
-    raises keeps its entry in the ledger for good: fail closed."""
+    raises keeps its entry in the ledger for good: fail closed. ``label``: an
+    ``adopt`` caller's own name for its step (``live_work_reasons``)."""
 
     kind: str
     stuck: bool = False
     then: Callable[[asyncio.Future], None] | None = None
+    label: str | None = None
 
 
 class TranscriptionServer:
@@ -519,10 +520,14 @@ class TranscriptionServer:
     - ``stuck_work_count``: diagnostic only (entries that outlived the bound
       their caller waited for). Never decide anything on it.
     - ``state`` / ``holds_socket_lock``: for logs and tests.
-    - ``adopt(task)``: hand the server a task of yours that touches it or its
-      backend, so the lock is kept until it ends (``serve`` uses it for its
-      readiness step from creation, ``stuck=False``, and for a startup or
-      readiness step that ignored its cancel).
+    - ``wait_closed()``: the current listener's close only (websockets'
+      ``wait_closed``); not a lock or stop signal. Use ``wait_stopped()``.
+    - ``adopt(task, abandoned=..., label=...)``: hand the server a task of
+      yours that touches it or its backend, so the lock is kept until it ends.
+      Valid only in ``starting`` / ``running`` / ``stopping``; in ``new`` or
+      ``stopped`` (no lock held) it raises ``RuntimeError``. ``serve`` uses it
+      for its readiness step from creation and, ``abandoned=True``, for a
+      startup or readiness step that ignored its cancel.
     """
 
     def __init__(self, backend: TranscriptionBackend, config: ServerConfig) -> None:
@@ -624,12 +629,15 @@ class TranscriptionServer:
         """Everything that can still touch the socket or the backend (the one
         live-work predicate, read from the one ledger; empty means the lock
         may be released)."""
-        counts: dict[str, int] = {}
+        counts: dict[tuple[str, str | None], int] = {}
         for w in self._live_entries():
-            counts[w.kind] = counts.get(w.kind, 0) + 1
+            key = (w.kind, w.label)
+            counts[key] = counts.get(key, 0) + 1
         reasons = []
-        for kind, n in counts.items():
+        for (kind, own), n in counts.items():
             label = _WORK_LABELS.get(kind, kind)
+            if own is not None:
+                label = f"{label}: {own}"
             reasons.append(label if kind == "listener" else f"{n} {label}")
         return reasons
 
@@ -670,6 +678,7 @@ class TranscriptionServer:
         *,
         stuck: bool = False,
         then: Callable[[asyncio.Future], None] | None = None,
+        label: str | None = None,
     ) -> None:
         """Count ``fut`` as live work of ``kind`` until it has completed AND
         its ``then`` cleanup has run (``_retire``, which re-settles the state).
@@ -685,7 +694,7 @@ class TranscriptionServer:
             return
         entry = self._live_work.get(fut)
         if entry is None:
-            self._live_work[fut] = entry = _Work(kind)
+            self._live_work[fut] = entry = _Work(kind, label=label)
             fut.add_done_callback(self._retire)
         if then is not None:
             entry.then = then
@@ -726,20 +735,37 @@ class TranscriptionServer:
         (the lock outlives it) and counts in ``stuck_work_count``."""
         self._track(fut, kind, stuck=True)
 
-    def adopt(self, fut: asyncio.Future, *, stuck: bool = True, kind: str = "adopted") -> None:
-        """Hand the server a task that touches it or its backend. It counts as
-        live work until it finishes (the lock is kept meanwhile).
+    def adopt(self, fut: asyncio.Future, *, abandoned: bool = False, label: str = "step") -> None:
+        """Hand the server a task of yours that touches it or its backend. It
+        counts as live work until it finishes, so the lock is kept meanwhile
+        (and a failed start that sees it ends in ``stopping``, not ``new``).
 
-        ``stuck=True`` (default): its caller stopped waiting for it (``serve``
-        does this with a startup or readiness step that ignored cancellation);
-        it is marked stuck (``stuck_work_count``) and its failure is logged.
-        ``stuck=False``: live work from creation while the caller still awaits
-        it (``serve``'s readiness step). Adopting a task again only adds the
-        stuck mark. ``kind`` is ``"adopted"`` or ``"readiness"`` (how
-        ``live_work_reasons`` names it)."""
-        if kind not in _ADOPTABLE_KINDS:
-            raise ValueError(f"adopt(kind=...) must be one of {sorted(_ADOPTABLE_KINDS)}")
-        self._track(fut, kind, stuck=stuck)
+        Precondition: state ``starting``, ``running`` or ``stopping``. In
+        ``new`` or ``stopped`` it raises ``RuntimeError`` and records nothing:
+        no lock is held there, so live work would either block a lock release
+        that ``shutdown()`` needs (``new``: it would be refused) or run with
+        the lock already released (``stopped``).
+
+        ``abandoned=False`` (default): you still await it (``serve``'s
+        readiness step, from creation). ``abandoned=True``: you stopped
+        waiting for it (``serve`` does this with a step that ignored its
+        cancel); it is marked stuck (``stuck_work_count``) and its failure is
+        logged -- at once if it already failed. A future that is already done
+        adds no live work. Adopting a task again only adds the stuck mark.
+        ``label`` is your own short name for it (``live_work_reasons`` shows
+        ``"1 adopted: <label>"``)."""
+        if not isinstance(label, str) or not label.strip():
+            raise ValueError("adopt(label=...) must be a non-empty string")
+        if self._state not in _ADOPTABLE_STATES:
+            raise RuntimeError(
+                f"stt_server: adopt() in state {self._state.value} refused; "
+                "valid only while starting, running or stopping"
+            )
+        if fut.done():
+            if abandoned:
+                _log_leftover_failure(fut)
+            return
+        self._track(fut, "adopted", stuck=abandoned, label=label)
 
     async def wait_stopped(self) -> None:
         """Wait until the server holds no lock and runs no work: state
@@ -1013,6 +1039,8 @@ class TranscriptionServer:
         return self._config
 
     async def wait_closed(self) -> None:
+        """Wait for the current listener's close (websockets' ``wait_closed``).
+        Listener only: not a lock or stop signal -- ``wait_stopped()`` is."""
         if self._server is not None:
             await self._server.wait_closed()
 
@@ -1986,7 +2014,7 @@ async def serve(
     that outlives that is handed to the server (``TranscriptionServer.adopt``):
     it keeps the lock until it ends (``live_work_count``; marked in
     ``stuck_work_count``). The readiness step is live work from creation
-    (``adopt(..., stuck=False)``). A cancel of ``serve`` landing while that
+    (``adopt(task, label=...)``). A cancel of ``serve`` landing while that
     bounded wait runs does not start a second one. ``serve`` uses only the
     server's public API, so an embedder can write the same loop.
     After ``shutdown()``, ``hard_exit_on_stop=True`` exits on any live work
@@ -2025,7 +2053,7 @@ async def serve(
     # The startup / readiness step in flight (and its stage), for every exit.
     pending: list[tuple[asyncio.Future, str]] = []
 
-    async def _abandon_step(task: asyncio.Future) -> None:
+    async def _abandon_step(task: asyncio.Future, stage: str) -> None:
         """Cancel a pending step and wait for it, bounded (one that swallows
         cancellation cannot hold the exit). One still running may touch the
         backend: the server keeps it as live work, holding the lock until it
@@ -2038,10 +2066,14 @@ async def serve(
         try:
             await asyncio.wait({task}, timeout=cfg.drain_timeout_seconds)
         finally:
-            if not task.done():
-                server.adopt(task)
-            elif not task.cancelled():
-                task.exception()  # retrieved; we are stopping regardless
+            if task.done():
+                if not task.cancelled():
+                    task.exception()  # retrieved; we are stopping regardless
+            elif server.state not in ("new", "stopped"):
+                server.adopt(task, abandoned=True, label=stage)
+            # Else only a startup step that never ran its first step is pending
+            # (``start()`` leaves ``new`` / ``stopped`` synchronously):
+            # cancelled, it ends touching nothing, and no lock is held to keep.
 
     async def _run_until_stop(coro: Awaitable[None], stage: str, *, track: bool = False) -> bool:
         """Await ``coro`` unless a stop arrives first; True when it completed
@@ -2049,7 +2081,7 @@ async def serve(
         (readiness; ``start()`` keeps its own in-flight entry)."""
         task = asyncio.ensure_future(coro)
         if track:
-            server.adopt(task, stuck=False, kind="readiness")
+            server.adopt(task, label=stage)
         pending[:] = [(task, stage)]
         await asyncio.wait({task, stop}, return_when=asyncio.FIRST_COMPLETED)
         if stop.done() and not task.done():
@@ -2057,7 +2089,7 @@ async def serve(
                 logger.warning("stt_server: stop requested during %s; exiting", stage)
                 _exit_process(0, abort=True, failure=None)
             logger.info("stt_server: stop requested during %s; cancelling it", stage)
-            await _abandon_step(task)
+            await _abandon_step(task, stage)
             return False
         await task
         return not stop.done()
@@ -2098,7 +2130,7 @@ async def serve(
                 if pending and not pending[0][0].done():
                     task, stage = pending[0]
                     logger.info("stt_server: serve exiting during %s; cancelling it", stage)
-                    await _abandon_step(task)
+                    await _abandon_step(task, stage)
             finally:
                 await server.shutdown()
         except BaseException as exc:

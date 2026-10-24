@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import shutil
 import tempfile
 from pathlib import Path
@@ -1159,18 +1160,107 @@ def test_serve_uses_only_the_public_server_api():
     assert len(pops) == 1 and src.index("def ", end_work + 1) > pops[0] > end_work
 
 
-async def test_adopt_kind_is_restricted_and_stuck_is_optional():
+async def test_adopt_label_is_free_form_and_abandoned_is_opt_in():
     srv = TranscriptionServer(EchoBackend(), ServerConfig(host="127.0.0.1", port=0))
+    await srv.start()
     fut = asyncio.get_running_loop().create_future()
     with pytest.raises(ValueError):
-        srv.adopt(fut, kind="session")
-    srv.adopt(fut, stuck=False, kind="readiness")
-    assert srv.live_work_reasons == ["1 readiness steps"] and srv.stuck_work_count == 0
-    srv.adopt(fut)
-    assert srv.live_work_count == 1 and srv.stuck_work_count == 1
+        srv.adopt(fut, label="")
+    srv.adopt(fut, label="my warm-up")  # default: still awaited, not stuck
+    assert "1 adopted: my warm-up" in srv.live_work_reasons and srv.stuck_work_count == 0
+    srv.adopt(fut, abandoned=True)  # again: only adds the stuck mark
+    assert srv.live_work_count == 2 and srv.stuck_work_count == 1  # + the listener
     fut.set_result(None)
     await asyncio.sleep(0)
-    assert srv.live_work_count == 0
+    assert srv.live_work_count == 1
+    await asyncio.wait_for(srv.shutdown(), T)
+
+
+_ADOPT_STATES = ["new", "starting", "running", "stopping", "stopped"]
+_ADOPT_OUTCOMES = ["pending", "done-ok", "done-failed", "cancelled"]
+
+
+async def _server_in(state: str, b: Gated, sock) -> tuple[TranscriptionServer, asyncio.Task | None]:
+    srv = _server(b, sock)
+    start_task = None
+    if state in ("starting", "stopping"):
+        b.gate.clear()
+        start_task = asyncio.ensure_future(srv.start())
+        await asyncio.wait_for(b.entered.wait(), T)
+        if state == "stopping":
+            await asyncio.wait_for(srv.shutdown(), T)
+    elif state == "running":
+        await srv.start()
+    elif state == "stopped":
+        await srv.start()
+        await asyncio.wait_for(srv.shutdown(), T)
+        await asyncio.wait_for(srv.wait_stopped(), T)
+    assert srv.state == state
+    return srv, start_task
+
+
+def _adoptee(outcome: str) -> asyncio.Future:
+    fut = asyncio.get_running_loop().create_future()
+    if outcome == "done-ok":
+        fut.set_result(None)
+    elif outcome == "done-failed":
+        fut.set_exception(ValueError("adoptee boom"))
+    elif outcome == "cancelled":
+        fut.cancel()
+    return fut
+
+
+@pytest.mark.parametrize("abandoned", [False, True])
+@pytest.mark.parametrize("outcome", _ADOPT_OUTCOMES)
+@pytest.mark.parametrize("state", _ADOPT_STATES)
+async def test_adopt_state_outcome_matrix(sock, caplog, state, outcome, abandoned):
+    """``adopt`` is valid only while a lock is held (starting / running /
+    stopping): in ``new`` / ``stopped`` it is refused and records nothing, so
+    ``shutdown()`` still works and no live work runs unlocked. A pending
+    adoptee keeps the lock until it ends; an already-failed one is logged when
+    abandoned. Throughout: lock held iff live work (Unix-socket mode)."""
+    b = Gated()
+    srv, start_task = await _server_in(state, b, sock)
+    before_live, before_stuck = srv.live_work_count, srv.stuck_work_count
+    assert _lock_view(srv, sock) is (before_live > 0)
+    fut = _adoptee(outcome)
+    with caplog.at_level(logging.ERROR, logger="stt_server"):
+        if state in ("new", "stopped"):
+            with pytest.raises(RuntimeError, match=f"adopt\\(\\) in state {state}"):
+                srv.adopt(fut, abandoned=abandoned, label="mine")
+            assert srv.state == state and srv.live_work_count == 0
+            assert not _lock_view(srv, sock)
+        else:
+            srv.adopt(fut, abandoned=abandoned, label="mine")
+            pending = outcome == "pending"
+            assert srv.live_work_count == before_live + pending
+            assert srv.stuck_work_count == before_stuck + (pending and abandoned)
+            assert ("1 adopted: mine" in srv.live_work_reasons) is pending
+    logged = "leftover task failed" in caplog.text
+    assert logged is (state not in ("new", "stopped") and outcome == "done-failed" and abandoned)
+    if outcome == "done-failed":
+        fut.exception()  # retrieved where adopt() did not log it
+
+    # Drive to the end: shutdown() always works, and the lock is kept exactly
+    # while the pending adoptee runs.
+    b.gate.set()
+    if start_task is not None:
+        await asyncio.wait({start_task}, timeout=T)
+        assert start_task.done()
+        if not start_task.cancelled():
+            start_task.exception()
+    await asyncio.wait_for(srv.shutdown(), T)
+    adopted_pending = outcome == "pending" and state not in ("new", "stopped")
+    if adopted_pending:
+        assert srv.state == "stopping" and srv.live_work_count == 1
+        assert _lock_view(srv, sock)
+    if not fut.done():
+        fut.set_result(None)
+    await asyncio.wait_for(srv.wait_stopped(), T)
+    assert srv.state == "stopped" and srv.live_work_count == 0
+    assert not _lock_view(srv, sock)
+    with pytest.raises(RuntimeError, match="single-use"):
+        await srv.start()
 
 
 async def test_serve_rejects_on_fatal_without_hard_exit():
