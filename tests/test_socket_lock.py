@@ -339,7 +339,7 @@ async def test_cancelled_shutdown_keeps_the_lock_until_close_finishes(short_home
     await asyncio.wait({task})
     assert socket_lock_held(sock) is True and srv.state == "stopping"
     gate.set()
-    await asyncio.wait_for(srv._stopped.wait(), 5)
+    await asyncio.wait_for(srv.wait_stopped(), 5)
     assert closed == [True]
     assert socket_lock_held(sock) is False and srv.state == "stopped"
 

@@ -13,11 +13,14 @@ cancelled task. Invariants under test:
    live-work predicate (listener, sessions, start/drain/close/bind/readiness
    steps, backend worker thread) is non-empty.
 3. ``shutdown()`` is idempotent, safe before ``start()``, concurrent-safe and
-   cancellation-safe (every caller waits for the one drain, close included); a
-   shut-down server is single-use (``start()`` raises).
+   cancellation-safe (every caller waits for the one drain, close included).
+   Single-use: once ``shutdown()`` was called, or a failed start left work
+   running (stopping), ``start()`` raises; a failed start that returned to new
+   may be retried, from a clean attempt (every per-attempt slot reset).
 4. A started backend is closed on every exit from ``start()`` short of running;
-   every wait on foreign code is bounded, and what outlives it is
-   ``stuck_task_count`` and keeps the lock.
+   every wait on foreign code is bounded, and what outlives it stays in the one
+   live-work ledger, marked stuck: ``stuck_task_count`` and the lock are views
+   of the same ledger. ``wait_stopped()`` is the public "lock is free" wait.
 
 Every wait is an event or a bounded ``asyncio.wait_for``: no sleeps decide an
 outcome, so a regression fails instead of hanging.
@@ -138,6 +141,106 @@ async def test_failed_start_is_retryable(sock):
     assert not _lock_view(srv, sock)
 
 
+class CloseFailsOnce(Gated):
+    async def close(self):
+        self.closes += 1
+        if self.closes == 1:
+            raise RuntimeError("first close failed")
+
+
+@pytest.mark.parametrize("first_close_fails", [False, True])
+async def test_retry_after_a_failed_start_closes_the_backend_again(
+    sock, monkeypatch, first_close_fails
+):
+    """Codex HIGH: the failed start's finished ``_close_task`` survived the
+    return to ``new``; the retry's shutdown reused it and never closed the
+    backend (starts=2, closes=1), or re-raised the first close's failure."""
+    b = CloseFailsOnce() if first_close_fails else Gated()
+    real_bind = S.ws_unix_serve
+    failures = [OSError("bind failed")]
+
+    async def bind(*a, **k):
+        if failures:
+            raise failures.pop()
+        return await real_bind(*a, **k)
+
+    monkeypatch.setattr(S, "ws_unix_serve", bind)
+    srv = _server(b, sock)
+    with pytest.raises(OSError, match="bind failed"):
+        await srv.start()
+    assert srv.state == "new" and not _lock_view(srv, sock)
+    assert (b.starts, b.closes) == (1, 1)
+    await srv.start()
+    await asyncio.wait_for(srv.shutdown(), T)  # never the first attempt's close error
+    assert (b.starts, b.closes) == (2, 2), "every started backend must be closed"
+    assert srv.state == "stopped" and not _lock_view(srv, sock)
+
+
+async def test_failed_start_resets_every_per_attempt_slot(sock, monkeypatch):
+    """Security minor: the bound-socket inode and ``_server`` (and the close
+    task, the shutdown event, the session sets) survived a failed start's
+    return to ``new``, so a retry's drain could act on attempt 1's inode."""
+    monkeypatch.setattr(S, "_CANCEL_GRACE_SECONDS", 0.05)
+    srv = _server(Gated(), sock, drain_timeout_seconds=0.05)
+
+    async def handler():
+        await asyncio.Event().wait()
+
+    async def accept_a_session(listener):
+        srv._active_handlers.add(asyncio.ensure_future(handler()))
+
+    gate, bound, _ = _slow_tail_bind(monkeypatch, accept_a_session)
+    task = asyncio.ensure_future(srv.start())
+    await asyncio.wait_for(bound.wait(), T)
+    task.cancel()  # one cancel: the bind finishes and its listener is adopted
+    await asyncio.sleep(0)
+    gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, T)
+    assert srv.state == "new" and not _lock_view(srv, sock)
+    assert srv._server is None
+    assert srv._bound_socket_id is None
+    assert srv._close_task is None
+    assert srv._stop_task is None
+    assert not srv._shutdown_event.is_set()
+    assert not srv._active_handlers and not srv._active_decodes
+    assert not srv._live_work
+    assert srv.sockets_bound == []
+
+
+async def test_wait_stopped_is_the_public_lock_free_wait(sock):
+    """``shutdown()`` from ``starting`` returns with the lock still held;
+    ``wait_stopped()`` returns only once it is free (and at once when it
+    already is: ``new``, or a failed start back in ``new``)."""
+    b = Gated()
+    srv = _server(b, sock)
+    await asyncio.wait_for(srv.wait_stopped(), T)  # new: nothing held
+    b.gate.clear()
+    task = asyncio.ensure_future(srv.start())
+    await asyncio.wait_for(b.entered.wait(), T)
+    await srv.shutdown()
+    assert srv.state == "stopping" and _lock_view(srv, sock)
+    waiter = asyncio.ensure_future(srv.wait_stopped())
+    await asyncio.sleep(0)
+    assert not waiter.done(), "wait_stopped() must not return while the lock is held"
+    b.gate.set()
+    with pytest.raises(RuntimeError, match="during startup"):
+        await asyncio.wait_for(task, T)
+    await asyncio.wait_for(waiter, T)
+    assert srv.state == "stopped" and not _lock_view(srv, sock)
+
+    b2 = Gated()
+    b2.gate.clear()
+    srv2 = _server(b2, sock)
+    task = asyncio.ensure_future(srv2.start())
+    await asyncio.wait_for(b2.entered.wait(), T)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.wait_for(srv2.wait_stopped(), T)  # back in new: lock free
+    assert srv2.state == "new" and not _lock_view(srv2, sock)
+
+
 # --- concurrent start ----------------------------------------------------------
 
 
@@ -249,7 +352,7 @@ async def test_cancel_during_drain_keeps_the_lock_while_sessions_run(sock):
         release.set()
         # The drain was never abandoned: it finishes (closing the backend) and
         # only then releases the lock.
-        await asyncio.wait_for(srv._stopped.wait(), T)
+        await asyncio.wait_for(srv.wait_stopped(), T)
         assert srv.state == "stopped" and not _lock_view(srv, sock)
         assert srv.backend.closes == 1
     finally:
@@ -285,7 +388,7 @@ async def test_hung_backend_close_is_bounded_and_keeps_the_lock(sock):
     await asyncio.wait_for(srv.shutdown(), T)  # a later caller: same drain
     assert b.closes == 1
     b.release.set()
-    await asyncio.wait_for(srv._stopped.wait(), T)
+    await asyncio.wait_for(srv.wait_stopped(), T)
     assert b.closed == 1 and srv.stuck_task_count == 0
     assert srv.state == "stopped" and not _lock_view(srv, sock)
 
@@ -352,10 +455,26 @@ async def test_second_cancel_during_bind_never_orphans_the_listener(sock, monkey
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, T)
-    # The bind is still running: it is live work, so the lock stays held.
+    # The bind is still running: it is live work, so the lock stays held, and
+    # it outlived its start, so it is stuck (one ledger: the CLI's hard exit
+    # sees what holds the lock).
     assert srv.state == "stopping" and _lock_view(srv, sock)
+    assert srv.stuck_task_count == 1
+    # Security minor: ``Server.close()`` only schedules the listening
+    # socket's close; the lock must not be released before it really closed.
+    serving_at_release = []
+    real_release = srv._release_lock
+
+    def spy_release():
+        if srv._lock_fd is not None:
+            serving_at_release.append(listeners[0].is_serving())
+        real_release()
+
+    srv._release_lock = spy_release
     gate.set()
-    await asyncio.wait_for(srv._stopped.wait(), T)
+    await asyncio.wait_for(srv.wait_stopped(), T)
+    assert serving_at_release == [False], "lock released while the orphan listener served"
+    assert srv.stuck_task_count == 0
     (listener,) = listeners
     assert not listener.is_serving()
     assert not sock.exists()
@@ -406,8 +525,12 @@ async def test_failed_start_drains_the_sessions_it_accepted(sock, monkeypatch, t
         if session == "stubborn":
             assert not t.done() and srv.stuck_task_count == 1
             assert srv.state == "stopping" and _lock_view(srv, sock)
+            # Single-use, and the error names the real cause.
+            cause = "after shutdown" if trigger == "shutdown" else "failed start"
+            with pytest.raises(RuntimeError, match=cause):
+                await srv.start()
             release.set()
-            await asyncio.wait_for(srv._stopped.wait(), T)
+            await asyncio.wait_for(srv.wait_stopped(), T)
             assert srv.state == "stopped"
         else:
             assert t.done()
@@ -436,6 +559,25 @@ async def test_release_is_refused_while_live_work_remains(sock):
     assert srv.state == "stopped" and not _lock_view(srv, sock)
 
 
+async def test_a_session_is_live_work_from_creation(sock):
+    """Architecture minor: a live session counted only through a side set no
+    callback re-settled; it must be in the one ledger from creation, so its
+    end alone moves ``stopping`` to ``stopped``."""
+    from websockets.asyncio.client import unix_connect
+
+    srv = _server(Gated(), sock)
+    await srv.start()
+    async with unix_connect(str(sock)) as ws:
+        await asyncio.wait_for(ws.recv(), T)  # server.hello: the handler runs
+        assert "1 session/decode tasks" in srv._live_reasons()
+        srv._transition(S._State.STOPPING)  # bypass the drain on purpose
+        srv._close_listener()
+        assert srv._live_reasons() == ["1 session/decode tasks"]
+        assert srv.state == "stopping" and _lock_view(srv, sock)
+    await asyncio.wait_for(srv.wait_stopped(), T)  # the session's end settles it
+    assert srv.state == "stopped" and not _lock_view(srv, sock)
+
+
 # --- serve(): a readiness step that ignores cancellation --------------------------
 
 
@@ -443,10 +585,9 @@ async def test_soft_stop_keeps_an_uncancellable_readiness_step(sock, monkeypatch
     """Codex medium: after its bounded wait, a soft stop dropped a readiness
     task that ignored cancellation; serve returned, the lock was released, and
     the task later failed unobserved (and could still touch the backend)."""
+    import functools
     import os
     import signal
-
-    import functools
 
     monkeypatch.setattr(
         S, "ServerConfig", functools.partial(S.ServerConfig, drain_timeout_seconds=0.05)
@@ -472,7 +613,7 @@ async def test_soft_stop_keeps_an_uncancellable_readiness_step(sock, monkeypatch
         assert srv.stuck_task_count == 1
         assert srv.state == "stopping" and _lock_view(srv, sock)
         gate.set()
-        await asyncio.wait_for(srv._stopped.wait(), T)
+        await asyncio.wait_for(srv.wait_stopped(), T)
         assert not _lock_view(srv, sock)
         assert "warm-up failed late" in caplog.text
     finally:
@@ -507,11 +648,14 @@ async def test_backend_decode_thread_keeps_the_lock(sock):
     await srv.start()
     b.idle()  # a decode thread is in flight (its task already cancelled/done)
     await srv.shutdown()
-    assert srv.stuck_task_count == 0  # no asyncio task is left ...
-    assert srv.state == "stopping" and _lock_view(srv, sock)  # ... but the thread is
+    # One ledger: the thread holds the lock AND counts as stuck, so the CLI's
+    # hard exit and the lock agree.
+    assert srv.stuck_task_count == 1
+    assert srv.state == "stopping" and _lock_view(srv, sock)
     b.thread_done.set_result(None)
-    await asyncio.sleep(0)
+    await asyncio.wait_for(srv.wait_stopped(), T)
     assert srv.state == "stopped" and not _lock_view(srv, sock)
+    assert srv.stuck_task_count == 0
 
 
 async def test_decode_guard_idle_tracks_the_thread():
