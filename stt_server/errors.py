@@ -29,10 +29,13 @@ class ConfigError(ValueError):
     """A rejected endpoint or CLI configuration (``ConfigError`` code).
 
     Raised by ``ServerConfig``, the socket-directory enforcement, the backend
-    registry (unknown ``--backend`` name) and ``prefetch``'s model checks. A
-    ``ValueError`` subclass, so existing ``except ValueError`` callers are
-    unaffected; a plain ``ValueError`` (for example from a model library during
-    warm-up) is NOT a config error.
+    registry (unknown ``--backend`` name), ``prefetch``'s model checks and
+    ``serve(on_fatal=...)`` without ``hard_exit_on_stop=True``. A ``ValueError``
+    subclass, so existing ``except ValueError`` callers are unaffected; a plain
+    ``ValueError`` (for example from a model library during warm-up) is NOT a
+    config error. A Hub input-validation error (``HFValidationError``: a
+    malformed repo id or revision) is not a ``ConfigError`` instance but is
+    classified as one: use :func:`is_config_error`, not ``isinstance``.
     """
 
 

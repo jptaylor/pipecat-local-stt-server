@@ -97,8 +97,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extra) runs the backend's `abort()`, so parakeet/nemotron no longer leak a
   private temp dir per failed start.
 - `shutdown()` is bounded even when a session task delays or swallows
-  cancellation (drain timeout, then a 2 s cancel grace), and releases the
-  single-server lock even when draining or `backend.close()` fails.
+  cancellation or `backend.close()` hangs: the drain timeout, plus two 2 s
+  cancel graces (the cancelled sessions' unwind, then the listener's
+  `wait_closed`), plus the backend `close()` bounded by the drain timeout
+  again. It releases the single-server lock even when draining or
+  `backend.close()` fails.
 - A decode thread that fails to start no longer leaves the in-flight count
   raised (which made every later `close()` wait out its drain window).
 - `kyutai` weight filenames from `config.json` must be plain filenames (no path
@@ -157,7 +160,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   really closed. A failed start that returns to `new` resets every per-attempt
   slot, so a retry closes its backend again (it reused the first attempt's
   finished close, leaving the backend open) and never acts on the first
-  attempt's socket inode.
+  attempt's socket inode. An entry stays live until its own cleanup has run,
+  not just until its future is done, so another piece of work ending in the
+  same loop tick can no longer release the lock before an orphan bind's
+  listener is closed and unlinked; every task the server creates (the bind,
+  the listener's `wait_closed`, which now lingers past its grace instead of
+  being cancelled) is live work from creation; and session / decode tasks
+  are registered only in the ledger.
+- `serve`: when `shutdown()` also fails after `serve` was already failing, the
+  first failure is raised (and handed to `on_fatal`); the shutdown failure is
+  logged instead of replacing it.
 - `prefetch --check` reports a malformed Hub repo id as `ConfigError` (exit 1),
   as a fetch does, instead of `cached: false`.
 - The `<socket>.lock` mode no longer depends on the umask (a `0777` umask made

@@ -403,9 +403,49 @@ pending strands the lock until process exit (the release runs as a loop
 callback; a fix needs an off-loop release path). Documented in
 `wait_stopped()`: await it before closing the loop.
 
+### Round 6 (review gauntlet)
+
+The round-6 server findings were gaps in the ledger's definition of "live",
+fixed at the definition:
+
+- **Live until its own cleanup ran.** `_live_entries` dropped a future as soon
+  as it was done, before its done-callbacks had registered successor work: an
+  orphan bind and another entry finishing in the same loop tick let the
+  other's `_settle` release the lock and reset the attempt before the orphan
+  listener was closed and unlinked. Each tracked future now has ONE
+  done-callback, `_retire`, which runs the entry's `then` cleanup (the orphan
+  bind's `_close_orphan_listener`, registering the listener close) and only
+  then pops it and re-settles. Old invariant: "live = future not done";
+  new: "live = in the ledger; an entry leaves only after its cleanup, so
+  successor-then-retire is atomic".
+- **Every server task in the ledger from creation.** The normal bind task and
+  the listener's `wait_closed` were created outside it, and a `wait_closed`
+  past its grace was cancelled (which only ended our wait: websockets' close
+  task and the handshakes it waits for kept running). The bind is tracked at
+  creation; `_begin_listener_close` registers the close before retiring the
+  bound listener (shared by the normal and the orphan close); a close past its
+  grace lingers, stuck. After a drain every still-running non-step entry is
+  marked stuck, so "lock held" and `stuck_work_count > 0` still agree. A test
+  installs a task factory and fails if any task created from `server.py`
+  leaves the ledger before it completes.
+- **One session registry.** `_active_handlers` / `_active_decodes` are gone;
+  the drain waits on and cancels the ledger's `session` entries.
+- `_reset_attempt` has a structural test: `vars()` after a failed start's
+  return to `new` against a fresh instance, with an explicit allow-list of
+  attempt-spanning fields, and `_reset_attempt` alone must assign every
+  per-attempt slot.
+- `stuck_task_count` renamed `stuck_work_count` (unreleased, no alias); the
+  CLI logs "N pieces of work outlived shutdown".
+- `serve`: a `shutdown()` failure during cleanup no longer replaces the
+  primary failure (it is logged; the primary reaches the caller / `on_fatal`).
+- Docs: CHANGELOG `shutdown()` bound (drain timeout + two 2 s cancel graces +
+  close bounded by the drain timeout); `abort()` contract "stopping or
+  stopped"; `ConfigError` docstring lists `serve(on_fatal=...)` and the Hub
+  validation case via `is_config_error()`.
+
 ## Final Results
 
 - All phases and follow-ups complete on `fix/pr14-review-findings`, including
-  the round-2 to round-4 fixes; Ruff format/check clean; full suite 554 passed, 3 skipped,
+  the round-2 to round-6 fixes; Ruff format/check clean; full suite 562 passed, 3 skipped,
   1 failed: the pre-existing, unrelated
   `tests/test_justfile_recipes.py::test_stt_list_prints_socket_in_tilde_form`.

@@ -70,8 +70,8 @@ class TranscriptionBackend(Protocol):
 #   a ``TranscriptionServer`` whose failed ``start()`` returned it to ``new``
 #   may be started again, and its backend may always be handed to a new server
 #   (a server is single-use once ``shutdown()`` was called or a failed start
-#   left work running, i.e. it is ``stopping``). ``close()`` may call it too,
-#   after its bounded drain.
+#   left work running, i.e. it is ``stopping`` or ``stopped``). ``close()``
+#   may call it too, after its bounded drain.
 # - ``idle()`` (instance method, :class:`IdleAwareBackend`): returns an
 #   ``asyncio.Future`` that completes once no backend-owned worker thread (a
 #   decode daemon thread) is still running. Must not block. Cancelling a decode
