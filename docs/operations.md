@@ -48,10 +48,12 @@ live server whose listen backlog is full is never mistaken for a stale socket.
   a contended lock for 250 ms, so the check never makes a real start fail. It
   opens the file non-blocking and treats anything but a plain file you own as
   "not held" (the real start then refuses it), so a planted FIFO cannot hang it.
-- If a session task ignores cancellation past the shutdown grace, or a decode
-  thread is still running on the GPU after its task was cancelled, the lock
-  stays held until that work finishes (also when the shutdown itself was
-  cancelled); `python -m stt_server serve` exits the process at that point,
+- If a session task ignores cancellation past the shutdown grace, a decode
+  thread is still running on the GPU after its task was cancelled, or
+  `backend.close()` is still running past its bound (the drain timeout, 10 s),
+  the lock stays held until that work finishes (also when the shutdown itself
+  was cancelled, or when the work was left by a failed start);
+  `python -m stt_server serve` exits the process at that point,
   which releases it. A failure in flight at that exit (for example
   `backend.close()` raising) is still printed and, under `--supervised`,
   emitted as the `error` event, with exit status 1.

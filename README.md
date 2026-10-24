@@ -325,8 +325,11 @@ A backend is registered in one place and picked up by `--backend`, the
    snapshot with `snapshot.mark_model_invalid()`.
 3. **Optional `abort()`** if the backend owns cleanup that must survive a failed
    start or a hard exit (e.g. a private temp dir): synchronous, idempotent, safe
-   while a decode thread still runs, and undone by the next `start()`. The full
-   contract is in `stt_server/backend.py`.
+   while a decode thread still runs, and undone by the next `start()`. A failed
+   start calls it after `close()` when the backend's `start()` had returned.
+   Optional `idle()` (`IdleAwareBackend`) reports when no decode thread is left;
+   the server keeps its lock until then. The full contracts are in
+   `stt_server/backend.py`.
 4. **Registry**: a `BackendEntry` in `stt_server/backends/__init__.py`
    `BACKENDS` (module, class name, default model, `local_model_paths`).
 5. **Packaging**: an extra in `pyproject.toml` (plus a `[tool.uv]` `conflicts`

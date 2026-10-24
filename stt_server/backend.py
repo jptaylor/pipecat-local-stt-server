@@ -56,9 +56,11 @@ class TranscriptionBackend(Protocol):
 #
 # - ``abort()`` (instance method, :class:`AbortableBackend`): synchronous, cheap,
 #   non-blocking cleanup -- no thread joins, no Metal drain -- e.g. removing a
-#   private temp dir. ``TranscriptionServer`` calls it when ``start()`` fails
-#   (``close()`` never runs for a server that never started) and from
-#   ``abort_sync()`` before a hard process exit. It may run before ``start()``,
+#   private temp dir. ``TranscriptionServer`` calls it when its ``start()``
+#   fails or is cancelled -- after ``close()`` if the backend's ``start()`` had
+#   returned (that ``close()`` is bounded and may still be running), alone if
+#   it had not -- and from ``abort_sync()`` before a hard process exit (no
+#   ``close()``). It may run before ``start()``,
 #   more than once, and while a decode / lazy model-load daemon thread is still
 #   running (threads cannot be cancelled: a stop during warm-up leaves one
 #   behind). So it must be idempotent and must not wait for or break that
@@ -71,10 +73,11 @@ class TranscriptionBackend(Protocol):
 # - ``idle()`` (instance method, :class:`IdleAwareBackend`): returns an
 #   ``asyncio.Future`` that completes once no backend-owned worker thread (a
 #   decode daemon thread) is still running. Must not block. Cancelling a decode
-#   task does not stop its thread, so after ``close()`` the server keeps the
-#   single-server lock until this future completes: no new server may load a
-#   model while this one's decode still runs. Without the hook the server can
-#   only see its own asyncio tasks.
+#   task does not stop its thread, so after every drain (``shutdown()``, or a
+#   failed ``start()``) the server keeps the single-server lock until this
+#   future completes: no new server may load a model while this one's decode
+#   still runs (a failed start that waits on it becomes single-use). Without
+#   the hook the server can only see its own asyncio tasks.
 # - ``prefetch_specs(model: str | None) -> list[SnapshotSpec]`` (module-level
 #   function in the backend's module, registered in ``backends.BACKENDS``): the
 #   Hugging Face snapshots ``python -m stt_server prefetch`` fetches/checks so

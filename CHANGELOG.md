@@ -69,8 +69,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `TranscriptionServer` is **single-use**: after `shutdown()` (in any state,
   including before `start()`) `start()` raises `RuntimeError`; build a new
   server to serve again. A failed or cancelled `start()` returns the server to
-  `new` and may be retried. `start()` while another `start()` is in flight
-  raises `RuntimeError` instead of racing it for the lock.
+  `new` and may be retried, unless work it started outlived its cleanup (a
+  session, a backend `close()`, a bind finishing after a second cancel): then
+  it stays `stopping`, holding the lock until that work ends, and is
+  single-use. `start()` while another `start()` is in flight raises
+  `RuntimeError` instead of racing it for the lock.
+- `serve(on_fatal=...)` without `hard_exit_on_stop=True` raises `ConfigError`
+  (it would never be called).
+- `stt_server.IdleAwareBackend` is exported alongside `AbortableBackend`.
 - `backends.import_backend()` raises `ConfigError` for an unknown name (was
   `KeyError`) and returns a `LoadedBackend` (`entry`, `module`, `cls`).
 
@@ -127,6 +133,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hook, implemented by every Metal backend); a `shutdown()` during `start()`
   now `close()`s a backend whose `start()` had completed; `shutdown()` removes
   the Unix socket file it bound (only that inode).
+- The single-server lock is released in one place only (the transition to
+  `new`/`stopped`), refused while anything is still live: a bound listener, a
+  session or decode task, a start, drain or backend `close()` in flight, or a
+  backend decode thread. As a result: a failed start drains the sessions it
+  accepted before giving the lock back; a second cancel mid-bind can no longer
+  orphan a listener; `backend.close()` is bounded by the drain timeout (a hung
+  close keeps the lock, counts in `stuck_task_count`, so the CLI exits); a
+  cancelled `shutdown()` no longer abandons `backend.close()` and later
+  callers wait for it; and `serve` keeps a startup/readiness step that ignored
+  its cancel as live work (lock held until it ends, its failure logged).
 - `prefetch --check` reports a malformed Hub repo id as `ConfigError` (exit 1),
   as a fetch does, instead of `cached: false`.
 - The `<socket>.lock` mode no longer depends on the umask (a `0777` umask made

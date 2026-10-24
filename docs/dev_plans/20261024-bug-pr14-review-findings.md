@@ -338,9 +338,37 @@ Needs owner decision (above the review marker, left untouched): the `Status:`
 line still reads In Progress, and Requirements say Kyutai local paths report
 `cached: false` in check mode while the code (and tests) report `ConfigError`.
 
+### Round 4 (review gauntlet)
+
+- **One lock-release choke point.** The round-3 state machine still released
+  the lock by convention at two call sites, and each cancel/failure edge leaked
+  a variant. Now `_transition` into `new`/`stopped` is the only release and
+  refuses while the one live-work predicate (`_live_reasons`: bound listener,
+  session/decode tasks, start/drain/backend-close/bind/readiness steps,
+  `idle()` future) is non-empty. A failed start runs the same `_drain` as
+  `shutdown()` (sessions it accepted are drained; leftovers move it to
+  `stopping`, single-use, instead of `new`); a second cancel mid-bind tracks the
+  bind and closes its listener when it exists; `backend.close()` is one
+  server-owned task bounded by the drain timeout (a hung close lingers in
+  `stuck_task_count`, so the CLI hard-exits); the running drain is a
+  server-owned task, so a cancelled `shutdown()` caller never abandons the
+  close and later callers wait for it; `serve` adopts a startup/readiness step
+  that outlived its bounded cancel. Tests in `tests/test_server_lifecycle.py`
+  (double cancel, failed start x {shutdown, cancel} x {prompt, stubborn}
+  session, hung close, cancelled first shutdown then second, uncancellable
+  readiness, refused release), each mutation-checked.
+- `serve(on_fatal=...)` without `hard_exit_on_stop=True` raises `ConfigError`.
+- `IdleAwareBackend` exported from the package; `backend.py` `abort()`/`idle()`
+  contracts corrected (a failed start closes a started backend, then aborts).
+
+Quarantined in round 4 (refactors beyond the review scope, risky this late):
+splitting `server.py` (socket-dir security / lock / lifecycle / protocol /
+`serve`), moving the error markers and `mark_*` helpers from `snapshot.py` /
+`supervise.py` into `errors.py`, and a typed `prefetch_specs` protocol.
+
 ## Final Results
 
 - All phases and follow-ups complete on `fix/pr14-review-findings`, including
-  the round-2 fixes; Ruff format/check clean; full suite 519 passed, 3 skipped,
+  the round-2 to round-4 fixes; Ruff format/check clean; full suite 554 passed, 3 skipped,
   1 failed: the pre-existing, unrelated
   `tests/test_justfile_recipes.py::test_stt_list_prints_socket_in_tilde_form`.
