@@ -15,7 +15,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alone cannot tell a stale socket from a live one with a full listen backlog
   (macOS returns `ECONNREFUSED` for both). The kernel drops the lock when the
   process dies, so it cannot go stale; clients never touch it, so any number
-  share one server. The lock file is left in place on exit.
+  share one server. The lock file is left in place on exit. A pre-existing lock
+  file we own with group/other permission bits is tightened to `0600`; one owned
+  by another user is refused. The preflight probe takes a shared lock and a
+  starter retries a contended lock for 250 ms, so a probe never makes a
+  concurrent real start fail.
+- `ModelInvalidError` supervised/prefetch error code: the model snapshot is
+  present but unusable (incomplete, corrupt or incomplete `config.json`). Existing
+  codes are unchanged.
+- `serve(..., hard_exit_on_stop=False)`: a stop during startup/warm-up now
+  cancels the pending step and shuts down normally for in-process callers; the
+  CLI passes `True` to keep the immediate exit.
+- `backends.BACKENDS` registry: CLI choices, `--model` defaults, construction and
+  the prefetch module map derive from one table. `SnapshotSpec` moved to the
+  stdlib-only `stt_server.snapshot` (still importable from `stt_server.prefetch`);
+  the optional backend `abort()` hook and module-level `prefetch_specs()` are
+  documented in `stt_server/backend.py`.
 
 - **`serve --supervised`** for a managing parent process: stdout carries only
   JSON lines (`ready` once listening and warm, with the real port; or `error`
@@ -35,10 +50,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- A stop during startup or warm-up (`serve`, `serve --supervised`) still exits
-  immediately but now removes the Unix socket file it bound (only that inode)
-  and the parakeet/nemotron private temp dir, via
-  `TranscriptionServer.abort_sync()` and an optional backend `abort()` hook.
+- A stop during startup or warm-up (`python -m stt_server serve`, with or without
+  `--supervised`) still exits immediately but now removes the Unix socket file it
+  bound (only that inode) and the parakeet/nemotron private temp dir, via
+  `TranscriptionServer.abort_sync()` and an optional backend `abort()` hook. The
+  single-server lock is held until the process exits.
+- A failed `start()` (lock held, socket-directory refusal, bind failure, missing
+  extra) runs the backend's `abort()`, so parakeet/nemotron no longer leak a
+  private temp dir per failed start.
+- `shutdown()` is bounded even when a session task delays or swallows
+  cancellation (drain timeout, then a 2 s cancel grace), and releases the
+  single-server lock even when draining or `backend.close()` fails.
+- A decode thread that fails to start no longer leaves the in-flight count
+  raised (which made every later `close()` wait out its drain window).
+- `kyutai` weight filenames from `config.json` must be plain filenames (no path
+  separators, `..` or glob characters) before they are fetched or matched.
 - `prefetch --json` progress is consistent: `total_bytes` / `files_total` count
   only files not yet cached (as in `tts_server prefetch`), `downloaded_bytes`
   includes partial `.incomplete` blobs from an interrupted run, `files_done` is a
@@ -49,9 +75,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `*.safetensors`.
 - A listener-preflight error (e.g. `ECONNRESET`/`ECONNABORTED` from the Unix
   socket probe) is reported as `BackendStartError`, not `ModelDownloadError`. A
-  bare `ConnectionError`/`TimeoutError` is a download failure only when raised
-  during warm-up or a `prefetch` fetch, or when a network library raised it.
-  Error codes are unchanged.
+  bare `ConnectionError`/`TimeoutError` is a download failure only when raised by
+  a backend's model fetch-and-load call or a `prefetch` download, or when a
+  network library raised it (a decode during warm-up is not a download). A
+  `prefetch` failure where nothing network-related failed is `ModelInvalidError`.
 - `TranscriptionServer.listening_port()` returns `None` for a Unix socket
   instead of a character of its path. `TranscriptionServer` exposes read-only
   `backend` and `config`.

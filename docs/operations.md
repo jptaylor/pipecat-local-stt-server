@@ -5,7 +5,7 @@
 ## Multi-backend operation
 
 Each server process loads exactly **one** backend, pinned at launch via
-`--backend {echo,mlx,parakeet,nemotron}`. To run more than one ASR — for example to
+`--backend {echo,mlx,parakeet,nemotron,kyutai}`. To run more than one ASR — for example to
 A/B-benchmark Parakeet against Whisper — start a second server process on a
 **separate socket**. The V1 wire protocol is unchanged; the only difference
 between two ASRs from the bot's perspective is which socket it connects to.
@@ -17,6 +17,27 @@ between two ASRs from the bot's perspective is which socket it connects to.
 | whisper (`mlx`) | `pipecat.stt-server` | `~/Library/Caches/pipecat-stt/stt.sock` | leave `STT_WS_SOCKET` unset |
 | parakeet | `pipecat.stt-server.parakeet` | `~/Library/Caches/pipecat-stt/parakeet.sock` | set `STT_WS_SOCKET` to the parakeet socket |
 | nemotron | `pipecat.stt-server.nemotron` | `~/Library/Caches/pipecat-stt/nemotron.sock` | set `STT_WS_SOCKET` to the nemotron socket |
+
+### Single-server lock file
+
+Each Unix socket gets a sibling lock file, `<socket>.lock` (for example
+`~/Library/Caches/pipecat-stt/parakeet.sock.lock`). A server takes an exclusive
+`flock` on it before loading the model, so a second server for the same socket
+fails in milliseconds with `EADDRINUSE` instead of after a multi-GB load, and a
+live server whose listen backlog is full is never mistaken for a stale socket.
+
+- Mode `0600`, owned by the server user. A pre-existing lock file you own with
+  looser permissions is tightened to `0600`; one owned by another user, or a
+  symlink, makes the server refuse to start.
+- The kernel releases the lock when the server process exits for any reason
+  (including `SIGKILL` and the immediate exit on a stop during startup), so it
+  cannot go stale.
+- It is never unlinked: deleting it while a server runs, or between two
+  starters, would let two servers own one socket. Leaving it behind is
+  harmless. Clients never open it.
+- `serve --supervised` checks it before binding (a held lock is reported as
+  `EADDRINUSE`). The check takes a shared lock for an instant; a starter retries
+  a contended lock for 250 ms, so the check never makes a real start fail.
 
 Whisper uses the default label and socket, so a bot-side default of
 `~/Library/Caches/pipecat-stt/stt.sock` resolves to it with no `.env`
@@ -109,7 +130,13 @@ supervisor can show `downloaded_bytes / total_bytes` directly:
   and `files_done == files_total`.
 
 The `kyutai` backend reads its weight filenames from the repo's `config.json`,
-so quantized (`.q4`/`.q8`) repos fetch only the files the loader will open.
+so quantized (`.q4`/`.q8`) repos fetch only the files the loader will open. Each
+name must be a plain filename (no `/`, `..` or glob characters), or prefetch and
+the loader refuse it.
+
+A `prefetch` that fails with nothing network-related going wrong (an incomplete
+snapshot, a corrupt or incomplete `config.json`, a local model directory that is
+missing files) reports `code: ModelInvalidError`, not `ModelDownloadError`.
 
 ## Checking server health
 

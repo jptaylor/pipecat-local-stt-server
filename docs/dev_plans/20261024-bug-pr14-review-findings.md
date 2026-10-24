@@ -187,7 +187,8 @@ sequenceDiagram
 - [x] Phase 1: Supervised readiness cancellation
 - [x] Phase 2: Conservative UDS preflight
 - [x] Phase 3: Local-model prefetch validation
-- [ ] Phase 4: Verification and documentation
+- [x] Phase 4: Verification and documentation
+- [x] Follow-up fixes after the PR #14 re-review (see below)
 
 ## Findings
 
@@ -201,6 +202,59 @@ sequenceDiagram
 - The existing pytest launcher had a stale shebang. `uv sync --inexact` retained the environment; verification used `.venv/bin/python -m pytest` against the installed pytest 9.0.3.
 - The sandbox and computer-use safety layer both prevent a socket-capable full-suite run in this session. Phase 4 remains open.
 
+## Follow-up fixes (after the original three findings)
+
+Recorded here, below the review marker, so the reviewed plan above stays signed
+off. Each landed with a regression test that fails on the pre-fix code.
+
+- **Hard-exit cleanup.** A stop during startup/warm-up that exits via
+  `os._exit` first runs `TranscriptionServer.abort_sync()`: it unlinks the Unix
+  socket only if it is still the inode this process bound, and calls the
+  backend's optional `abort()` hook (parakeet/nemotron private temp dir). The
+  single-server lock is NOT released there; the kernel drops it at exit, so a new
+  server cannot start loading while the old process still exists.
+- **Hard exit is opt-in.** `serve(..., hard_exit_on_stop=False)` is the library
+  default: a stop during startup/warm-up cancels the pending step (bounded wait)
+  and runs the normal `shutdown()`. `python -m stt_server serve` (plain and
+  `--supervised`) passes `True`, keeping the prompt exit for the process owner.
+- **Prefetch progress.** `total_bytes`/`files_total` count only files not yet
+  cached, `downloaded_bytes` includes partial `.incomplete` blobs, and a final
+  progress event reaches the total before `done`.
+- **Kyutai config-named weights.** Prefetch and the loader take `mimi_name`,
+  `moshi_name` and `tokenizer_name` from the repo's `config.json` (one
+  `weight_files()` shared by both), and each name must be a plain filename: no
+  `/`, `..` or glob characters, since it is used as an `allow_patterns`/`fnmatch`
+  pattern.
+- **Error classification.** A bare `ConnectionError`/`TimeoutError` is a
+  `ModelDownloadError` only when tagged by `snapshot.download_phase()`, which
+  wraps a backend's fetch-and-load call and prefetch's Hub calls, never a
+  decode (warm-up is no longer tagged wholesale). A prefetch failure where the
+  snapshot itself is unusable (incomplete, corrupt or incomplete `config.json`,
+  incomplete local directory) is the new `ModelInvalidError`; existing codes are
+  unchanged. `_run_serve` chains its `SystemExit` with an explicit `from exc`.
+- **`DecodeGuardMixin`.** One decode-lock pair, in-flight counter and bounded
+  `close()` drain for all four MLX backends; `_run_guarded_decode` undoes the
+  in-flight mark if the decode thread fails to start.
+- **Single-server flock on `<socket>.lock`.** Taken before the model load; the
+  supervised preflight treats a held lock as a live server (a full backlog no
+  longer passes as stale). A pre-existing owned lock file with group/other bits
+  is tightened to `0600`, a foreign one refused; the preflight probe uses a
+  shared lock and a starter retries a contended lock for 250 ms, so a probe never
+  makes a concurrent real start fail.
+- **Lifecycle.** A failed `start()` runs the backend `abort()` hook (no temp-dir
+  leak per failed start); `shutdown()` is bounded even if a task swallows
+  cancellation (drain timeout + 2 s cancel grace, `wait_closed` bounded too) and
+  releases the lock in a `finally`.
+- **Structure.** `backends.BACKENDS` is the single registry for CLI choices,
+  `--model` defaults, construction and prefetch modules; `SnapshotSpec` moved to
+  the stdlib-only `stt_server.snapshot` (re-exported by `prefetch`); the optional
+  `abort()` hook and `prefetch_specs()` are documented in `backend.py`.
+
+Deferred (design scope, not fixed here): pinning Kyutai (or any backend) to a
+Hub revision, and a CI job that loads a real Kyutai model.
+
 ## Final Results
 
-- Pending implementation and verification.
+- All findings above resolved on `fix/pr14-review-findings`; Ruff format/check
+  clean; full suite green except the pre-existing, unrelated
+  `tests/test_justfile_recipes.py::test_stt_list_prints_socket_in_tilde_form`.

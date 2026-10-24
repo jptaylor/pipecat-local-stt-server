@@ -173,8 +173,15 @@ uv run python -m stt_server serve --backend mlx \
 
 `--model` is passed through verbatim; an unset value uses the backend-aware
 default (the Whisper repo for `mlx`/`echo`, `parakeet-tdt-0.6b-v3` for
-`parakeet`, `nemotron-3.5-asr-streaming-0.6b` for `nemotron`). Pointing a
+`parakeet`, `nemotron-3.5-asr-streaming-0.6b` for `nemotron`,
+`kyutai/stt-1b-en_fr-mlx` for `kyutai`). Pointing a
 backend at a mismatched repo fails fast at decode.
+
+Each Unix socket gets a sibling `<socket>.lock` file (e.g. `parakeet.sock.lock`,
+mode `0600`). The server holds an `flock` on it for its lifetime, so a second
+server for the same socket fails at once with `EADDRINUSE`. The kernel releases
+it when the process exits; the file is never deleted and is safe to leave. See
+[Operations: single-server lock file](docs/operations.md#single-server-lock-file).
 
 Nemotron's runtime dependency is `mlx-audio>=0.4.4` — the first PyPI release
 carrying Nemotron STT support ([Blaizzy/mlx-audio#774](https://github.com/Blaizzy/mlx-audio/pull/774),
@@ -207,7 +214,7 @@ Verify which model a running server actually loaded with
 
 ## Prefetching models
 
-`mlx`, `parakeet` and `nemotron` download their checkpoint on the first decode,
+`mlx`, `parakeet`, `nemotron` and `kyutai` download their checkpoint on the first decode,
 so a cold server answers its first request only after a multi-GB download.
 `prefetch` does the download up front, and `--check` answers "is it cached?"
 without touching the network:
@@ -219,7 +226,16 @@ uv run python -m stt_server prefetch --backend mlx --model mlx-community/whisper
 ```
 
 It fetches exactly what the backend loads, into the standard Hugging Face cache
-(`HF_HOME` / `HF_HUB_CACHE`). `--check` exits 0 whenever the probe ran; the
+(`HF_HOME` / `HF_HUB_CACHE`). `--model` may also name a local model directory: a
+value starting with `/`, `./`, `../` or `~` (or an existing relative path) is a
+local path, anything else a Hub repo id. A local directory is never downloaded;
+`--check` reports it cached only if it holds every file the backend requires,
+and a fetch fails with `ModelInvalidError` if it does not. `kyutai` loads by Hub
+repo id only and rejects local paths.
+
+```bash
+uv run python -m stt_server prefetch --backend parakeet --model ~/models/parakeet --check
+``` `--check` exits 0 whenever the probe ran; the
 answer is the `cached` field. With `--json` each stdout line is one event:
 
 | Event | Fields |
@@ -255,10 +271,13 @@ menu bar app. Logging on stderr is unchanged. In addition:
   exits 1. Codes: `EADDRINUSE` (a busy port, or a Unix socket a live server
   already owns, reported before the model loads), `EACCES`,
   `ModuleNotFoundError` (backend extra missing), `ModelDownloadError`,
+  `ModelInvalidError` (the cached or local model is incomplete or unreadable),
   `ConfigError`, `BackendStartError`.
 - **stdin EOF stops the server** exactly like SIGTERM. The parent keeps a pipe
   open, so the server exits when the parent closes it or dies. During startup
-  the process exits at once; interrupted downloads resume next time.
+  the process exits at once; interrupted downloads resume next time. (Embedding
+  `stt_server.server.serve()` in your own process? It cancels startup and shuts
+  down normally instead, unless you pass `hard_exit_on_stop=True`.)
 
 ```bash
 ( sleep 5 ) | uv run python -m stt_server serve --backend echo \
