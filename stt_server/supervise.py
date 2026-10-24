@@ -39,6 +39,7 @@ from .snapshot import MODEL_INVALID_ATTR as _MODEL_INVALID_ATTR
 from .snapshot import mark_download_phase, mark_model_invalid
 
 __all__ = [
+    "ConfigError",
     "classify_startup_error",
     "emit",
     "json_channel",
@@ -62,6 +63,20 @@ CODE_BACKEND_START = "BackendStartError"
 CODE_MODEL_INVALID = "ModelInvalidError"
 
 _DOWNLOAD_MODULE_PREFIXES = ("huggingface_hub", "requests", "urllib3", "hf_xet", "httpx")
+# Raised by ``huggingface_hub`` for a malformed repo id / revision before any
+# request: bad input, not a download failure. Recognised by name (lean import).
+_HUB_INPUT_ERROR_NAMES = frozenset({"HFValidationError"})
+
+
+class ConfigError(ValueError):
+    """A rejected endpoint or CLI configuration (``ConfigError`` code).
+
+    Raised by ``ServerConfig``, the socket-directory enforcement and
+    ``prefetch``'s backend/model checks. A ``ValueError`` subclass, so existing
+    ``except ValueError`` callers are unaffected; a plain ``ValueError`` (for
+    example from a model library during warm-up) is NOT a config error.
+    """
+
 
 _channel: TextIO | None = None
 
@@ -168,6 +183,11 @@ def classify_startup_error(exc: BaseException) -> tuple[str, str]:
     # raised while a download phase was running (``mark_download_phase``). The
     # same builtins from the listener preflight (e.g. a UDS probe's ECONNRESET)
     # are NOT downloads and fall through to ``BackendStartError``.
+    for e in chain:
+        if isinstance(e, ConfigError) or (
+            isinstance(e, ValueError) and type(e).__name__ in _HUB_INPUT_ERROR_NAMES
+        ):
+            return CODE_CONFIG, message
     in_download_phase = any(getattr(e, _DOWNLOAD_PHASE_ATTR, False) for e in chain)
     for e in chain:
         module = type(e).__module__ or ""
@@ -177,8 +197,7 @@ def classify_startup_error(exc: BaseException) -> tuple[str, str]:
             return CODE_MODEL_DOWNLOAD, f"model download failed: {e}"
     if any(getattr(e, _MODEL_INVALID_ATTR, False) for e in chain):
         return CODE_MODEL_INVALID, f"model snapshot is unusable: {message}"
-    if isinstance(exc, ValueError):
-        # ServerConfig and socket-directory enforcement reject bad endpoints
-        # with ValueError before anything binds.
-        return CODE_CONFIG, message
+    # Anything else -- including a bare ValueError from a model library -- is a
+    # backend start failure. A supervisor should treat a code it does not know
+    # the same way.
     return CODE_BACKEND_START, message

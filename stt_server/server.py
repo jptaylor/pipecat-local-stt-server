@@ -51,6 +51,7 @@ from websockets.asyncio.server import (
 from . import protocol as P
 from ._peercred import peer_uid
 from .backend import BackendStream, EchoBackend, TranscriptionBackend, abort_backend
+from .supervise import ConfigError
 
 # OpenAI Realtime groups errors into a coarse "type" field (e.g.
 # invalid_request_error, server_error, authentication_error) alongside the
@@ -136,11 +137,11 @@ def _enforce_socket_dir_secure(path: Path, trusted_root: Path) -> Path:
     # no ``resolve()`` the containment check below is purely lexical, and a
     # ``..`` segment could let a path that escapes the trusted root pass it.
     if not bind_dir.is_absolute():
-        raise ValueError(
+        raise ConfigError(
             f"socket directory {bind_dir} must be an absolute path under {trusted_root}"
         )
     if ".." in bind_dir.parts:
-        raise ValueError(
+        raise ConfigError(
             f"socket directory {bind_dir} must not contain '..' components; "
             f"point the socket at a direct path under {trusted_root}"
         )
@@ -151,7 +152,7 @@ def _enforce_socket_dir_secure(path: Path, trusted_root: Path) -> Path:
     # would only verify root-owned system directories that we do not own. Refuse
     # rather than pretend the path is safe.
     if bind_dir != trusted_root and trusted_root not in bind_dir.parents:
-        raise ValueError(
+        raise ConfigError(
             f"socket directory {bind_dir} is not under the trusted root "
             f"{trusted_root}; point the socket at a path under {trusted_root}"
         )
@@ -180,20 +181,20 @@ def _enforce_socket_dir_secure(path: Path, trusted_root: Path) -> Path:
         # the final path element, so a symlink anywhere in the chain is caught.
         st = os.lstat(component)
         if _stat.S_ISLNK(st.st_mode):
-            raise ValueError(
+            raise ConfigError(
                 f"socket directory component {component} is a symlink; refusing "
                 "to bind (a symlinked ancestor can be repointed by another user "
                 "to hijack the client-visible socket path)"
             )
         if st.st_uid != euid:
-            raise ValueError(
+            raise ConfigError(
                 f"socket directory component {component} is owned by uid "
                 f"{st.st_uid}, not the server uid {euid}; refusing to bind "
                 "(another user could replace the socket at this path)"
             )
         sticky = bool(st.st_mode & 0o1000)
         if not sticky and (st.st_mode & 0o022):
-            raise ValueError(
+            raise ConfigError(
                 f"socket directory component {component} is group/other-writable "
                 f"(mode {oct(st.st_mode & 0o7777)}); refusing to bind "
                 "(another user could replace the socket at this path)"
@@ -346,9 +347,9 @@ class ServerConfig:
 
     def __post_init__(self) -> None:
         if self.socket_path is None and (self.host is None or self.port is None):
-            raise ValueError("ServerConfig requires socket_path or host+port")
+            raise ConfigError("ServerConfig requires socket_path or host+port")
         if self.host is not None and self.host not in ("127.0.0.1", "::1", "localhost"):
-            raise ValueError("V1 only permits loopback binds (127.0.0.1/::1/localhost)")
+            raise ConfigError("V1 only permits loopback binds (127.0.0.1/::1/localhost)")
 
 
 @dataclass

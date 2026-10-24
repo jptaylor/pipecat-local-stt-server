@@ -51,6 +51,7 @@ from typing import Any
 # ``SnapshotSpec`` lives in the stdlib-only ``stt_server.snapshot`` (the backends
 # import it from there); re-exported here for existing callers.
 from .snapshot import SnapshotSpec, check_plain_filenames, download_phase, mark_model_invalid
+from .supervise import ConfigError
 
 __all__ = ["SnapshotSpec", "check_spec", "fetch_spec", "run_prefetch", "specs_for"]
 
@@ -63,11 +64,15 @@ def _resolved(spec: SnapshotSpec, path: str | Path) -> SnapshotSpec:
     """``spec`` with its filenames taken from the snapshot's ``config.json``.
 
     Raises ``FileNotFoundError``/``ValueError``/``KeyError`` when the config is
-    missing or does not name what the loader needs.
+    missing, not a JSON object, or does not name what the loader needs.
     """
     if spec.resolve is None:
         return spec
     config = json.loads((Path(path) / "config.json").read_text())
+    if not isinstance(config, dict):
+        # Valid JSON that is not an object (``null``, a list): as unusable as a
+        # corrupt file, and ``resolve`` is only defined for a mapping.
+        raise ValueError(f"{spec.repo_id} config.json is not a JSON object")
     # The names become ``allow_patterns`` and ``fnmatch`` patterns: refuse
     # anything that is not a literal plain filename.
     names = check_plain_filenames(tuple(spec.resolve(config)), source=f"{spec.repo_id} config.json")
@@ -101,7 +106,7 @@ def _entry(backend: str):
     try:
         return BACKENDS[backend]
     except KeyError:
-        raise ValueError(f"unknown backend: {backend!r}") from None
+        raise ConfigError(f"unknown backend: {backend!r}") from None
 
 
 def specs_for(backend: str, model: str | None) -> list[SnapshotSpec]:
@@ -115,7 +120,7 @@ def specs_for(backend: str, model: str | None) -> list[SnapshotSpec]:
 def local_specs_for(backend: str, model: str) -> list[SnapshotSpec]:
     """Attach an explicit local directory to the backend's structural specs."""
     if not _entry(backend).local_model_paths:
-        raise ValueError(f"the {backend} backend does not support local model paths")
+        raise ConfigError(f"the {backend} backend does not support local model paths")
     path = Path(model).expanduser()
     return [replace(spec, local_path=str(path)) for spec in specs_for(backend, model)]
 

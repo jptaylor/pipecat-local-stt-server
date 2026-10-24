@@ -457,6 +457,8 @@ def _fake_hub_with_config(tmp_path, monkeypatch, config: bytes | None, drop: str
         ("kyutai", b"{not json", None),  # corrupt config.json
         ("kyutai", b'{"tokenizer_name": "tokenizer.model"}', None),  # missing mimi_name
         ("kyutai", b'{"mimi_name": "*.safetensors", "tokenizer_name": "t.model"}', None),
+        ("kyutai", b"null", None),  # valid JSON, not an object
+        ("kyutai", b"[1, 2]", None),
     ],
 )
 def test_unusable_snapshot_is_model_invalid_not_download_error(
@@ -512,3 +514,31 @@ def test_kyutai_glob_config_never_reads_as_cached(tmp_path, monkeypatch, capsys)
     monkeypatch.setattr(PF, "_snapshot_download", lambda spec, *, local_files_only: str(snap))
     code, events, _ = _run(monkeypatch, capsys, "--backend", "kyutai", "--check", "--json")
     assert code == 0 and events[-1]["cached"] is False
+
+
+@pytest.mark.parametrize("config", [b"null", b"[]", b'"x"', b"3"])
+def test_kyutai_check_non_object_config_is_not_cached(tmp_path, monkeypatch, capsys, config):
+    """``--check`` reports a cached config.json that is valid JSON but not an
+    object as ``cached: false`` (an incomplete snapshot), not a crash
+    classified as BackendStartError."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "config.json").write_bytes(config)
+    monkeypatch.setattr(PF, "_snapshot_download", lambda spec, *, local_files_only: str(snap))
+    code, events, _ = _run(monkeypatch, capsys, "--backend", "kyutai", "--check", "--json")
+    assert code == 0 and events[-1]["event"] == "summary" and events[-1]["cached"] is False
+
+
+@pytest.mark.parametrize("check", [True, False])
+def test_prefetch_unknown_or_unsupported_backend_input_is_config_error(
+    tmp_path, monkeypatch, capsys, check
+):
+    """ConfigError is now raised explicitly (a bare ValueError no longer maps to
+    it): a local path for a backend that cannot load one stays a ConfigError."""
+    model = tmp_path / "local"
+    model.mkdir()
+    argv = ["--backend", "kyutai", "--model", str(model), "--json"]
+    if check:
+        argv.append("--check")
+    code, events, _ = _run(monkeypatch, capsys, *argv)
+    assert code == 1 and events[-1]["code"] == "ConfigError"

@@ -499,6 +499,14 @@ class _HubError(Exception):
 _HubError.__module__ = "huggingface_hub.errors"
 
 
+class HFValidationError(ValueError):
+    """Stand-in for ``huggingface_hub.errors.HFValidationError`` (bad repo id)."""
+
+
+HFValidationError.__module__ = "huggingface_hub.errors"
+_HubValidationError = HFValidationError
+
+
 @pytest.mark.parametrize(
     ("exc", "code"),
     [
@@ -513,7 +521,11 @@ _HubError.__module__ = "huggingface_hub.errors"
         (ConnectionResetError("reset"), "BackendStartError"),
         (TimeoutError("timed out"), "BackendStartError"),
         (OSError(errno.EPERM, "Operation not permitted"), "BackendStartError"),
-        (ValueError("V1 only permits loopback binds"), "ConfigError"),
+        (supervise.ConfigError("V1 only permits loopback binds"), "ConfigError"),
+        # A bare ValueError (e.g. from a model library during warm-up) is not a
+        # bad endpoint.
+        (ValueError("bad tensor shape"), "BackendStartError"),
+        (_HubValidationError("Repo id must be in the form 'repo_name'"), "ConfigError"),
         (RuntimeError("decoder exploded"), "BackendStartError"),
     ],
 )
@@ -793,3 +805,57 @@ def test_start_after_abort_recreates_private_tmpdir(monkeypatch, backend_name):
         assert (os.stat(backend._tmpdir).st_mode & 0o777) == 0o700
     finally:
         backend.abort()
+
+
+def test_endpoint_rejections_are_config_errors():
+    """Every ServerConfig / socket-directory rejection still classifies as
+    ConfigError now that a bare ValueError no longer does."""
+    from stt_server.server import ServerConfig, _enforce_socket_dir_secure
+
+    cases = []
+    for kwargs in ({}, {"host": "10.0.0.1", "port": 1}):
+        with pytest.raises(ValueError) as exc:
+            ServerConfig(**kwargs)
+        cases.append(exc.value)
+    for path in ("relative/stt.sock", "/tmp/../x/stt.sock", "/opt/elsewhere/stt.sock"):
+        with pytest.raises(ValueError) as exc:
+            _enforce_socket_dir_secure(Path(path), Path.home())
+        cases.append(exc.value)
+    assert [supervise.classify_startup_error(e)[0] for e in cases] == ["ConfigError"] * 5
+
+
+def _fake_kyutai_modules(monkeypatch, hf_hub_download):
+    core, nn = SimpleNamespace(), SimpleNamespace()
+    _fake_modules(
+        monkeypatch,
+        mlx={"core": core, "nn": nn},
+        sentencepiece={},
+        moshi_mlx={"models": None, "utils": None},
+        huggingface_hub={"hf_hub_download": hf_hub_download},
+    )
+    monkeypatch.setitem(sys.modules, "mlx.core", core)
+    monkeypatch.setitem(sys.modules, "mlx.nn", nn)
+
+
+@pytest.mark.parametrize(
+    "config_text",
+    [
+        "{not json",
+        "null",
+        "[]",
+        '{"mimi_name": "m.safetensors"}',
+        '{"mimi_name": "../m", "tokenizer_name": "t"}',
+    ],
+)
+def test_kyutai_serve_path_unusable_config_is_model_invalid(monkeypatch, tmp_path, config_text):
+    """Serve-path ``_get_model`` agrees with prefetch: a fetched config.json that
+    does not parse or name its files is ModelInvalidError, not ConfigError (a
+    bare ValueError) or BackendStartError (KeyError/TypeError)."""
+    from stt_server.backends.kyutai import KyutaiBackend
+
+    cfg = tmp_path / "config.json"
+    cfg.write_text(config_text)
+    _fake_kyutai_modules(monkeypatch, lambda *_a, **_k: str(cfg))
+    with pytest.raises(Exception) as exc:
+        KyutaiBackend(model="x/y")._get_model()
+    assert supervise.classify_startup_error(exc.value)[0] == "ModelInvalidError"

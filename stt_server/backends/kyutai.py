@@ -32,7 +32,7 @@ from collections.abc import AsyncGenerator
 from pathlib import Path
 
 from ..backend import TranscriptEvent
-from ..snapshot import SnapshotSpec, check_plain_filenames, download_phase
+from ..snapshot import SnapshotSpec, check_plain_filenames, download_phase, mark_model_invalid
 from . import DEFAULT_KYUTAI_MODEL
 from ._thread_util import DecodeGuardMixin
 
@@ -155,9 +155,17 @@ class KyutaiBackend(DecodeGuardMixin):
             from moshi_mlx import models, utils  # type: ignore
 
             with download_phase():
-                raw = json.loads(Path(hf_hub_download(self._model_id, "config.json")).read_text())
-            # The same validated names prefetch fetches (``weight_files``).
-            _config, mimi_name, moshi_name, tokenizer_name = weight_files(raw)
+                config_path = hf_hub_download(self._model_id, "config.json")
+            # A fetched config that does not parse or name its files is an
+            # unusable snapshot (``ModelInvalidError``), as in prefetch: neither
+            # a download failure nor a bad endpoint (a bare ValueError).
+            try:
+                raw = json.loads(Path(config_path).read_text())
+                # The same validated names prefetch fetches (``weight_files``).
+                _config, mimi_name, moshi_name, tokenizer_name = weight_files(raw)
+            except Exception as exc:
+                mark_model_invalid(exc)
+                raise
             with download_phase():
                 mimi_weights = hf_hub_download(self._model_id, mimi_name)
                 lm_weights = hf_hub_download(self._model_id, moshi_name)
@@ -258,6 +266,8 @@ def weight_files(config: dict) -> tuple[str, ...]:
     ``allow_patterns``/``fnmatch`` patterns, so each must be a literal plain
     filename (``ValueError`` otherwise: no ``/``, ``..`` or glob characters).
     """
+    if not isinstance(config, dict):
+        raise ValueError("kyutai config.json is not a JSON object")
     for key in ("mimi_name", "tokenizer_name"):
         if key not in config:
             raise KeyError(f"config.json has no {key!r}")
