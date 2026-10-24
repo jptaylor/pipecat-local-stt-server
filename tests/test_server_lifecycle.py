@@ -784,6 +784,28 @@ async def test_serve_rejects_on_fatal_without_hard_exit():
     assert b.aborts == 1 and b.starts == 0
 
 
+async def test_serve_keeps_the_primary_failure_when_shutdown_also_fails(caplog):
+    """Codex medium: a failing ``shutdown()`` (here the backend close) in
+    ``serve``'s cleanup replaced the readiness failure that caused the stop,
+    so the caller / ``on_fatal`` classified the wrong error."""
+
+    class BadClose(Gated):
+        async def close(self):
+            raise RuntimeError("metal teardown failed")
+
+    async def ready(server):
+        raise ValueError("warm-up failed")
+
+    with pytest.raises(ValueError, match="warm-up failed"):
+        await asyncio.wait_for(
+            S.serve(
+                BadClose(), host="127.0.0.1", port=0, install_signal_handlers=False, ready=ready
+            ),
+            T,
+        )
+    assert "metal teardown failed" in caplog.text  # the cleanup failure is logged
+
+
 # --- backend worker thread behind a cancelled decode task ----------------------
 
 

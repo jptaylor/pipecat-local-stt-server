@@ -1890,7 +1890,9 @@ async def serve(
     passes its own reporter: stderr message and, under ``--supervised``, the
     ``error`` event); without ``on_fatal`` it is logged. ``on_fatal`` without
     ``hard_exit_on_stop=True`` would never be called, so it is rejected
-    (``ConfigError``).
+    (``ConfigError``). When ``shutdown()`` also fails after ``serve`` was
+    already failing, the first failure is the one raised (and reported to
+    ``on_fatal``); the shutdown failure is logged.
 
     A startup or readiness step that outlives its bounded cancel is handed to
     the server (``TranscriptionServer.adopt``): it keeps the lock until it
@@ -1973,8 +1975,12 @@ async def serve(
         try:
             await server.shutdown()
         except BaseException as exc:
-            failure = exc
-            raise
+            if failure is None:
+                failure = exc
+                raise
+            # The primary failure keeps propagating (and is what ``on_fatal``
+            # / the caller classifies); the cleanup failure is only logged.
+            logger.error("stt_server: shutdown after a failure also failed", exc_info=exc)
         finally:
             if hard_exit_on_stop and server.stuck_work_count:
                 logger.warning(
