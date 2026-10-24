@@ -1001,6 +1001,138 @@ async def test_hard_exit_fires_on_any_live_entry_kind(monkeypatch):
     assert srv.stuck_work_count == 0 and srv.live_work_count == 1
 
 
+async def test_healthy_cli_shutdown_leaves_no_live_work(sock, monkeypatch):
+    """Codex medium: nothing proved a clean stop under the CLI's
+    ``hard_exit_on_stop=True`` returns normally (no ``os._exit``) with the
+    ledger empty, with an idle client and one mid-utterance connected."""
+    import os
+    import signal
+
+    from stt_server import TranscriptionClient
+
+    exits = []
+    monkeypatch.setattr(S.os, "_exit", exits.append)
+    ready_srv: list[TranscriptionServer] = []
+    published = asyncio.Event()
+
+    def publish(server):
+        ready_srv.append(server)
+        published.set()
+
+    serving = asyncio.ensure_future(
+        S.serve(EchoBackend(), socket_path=str(sock), publish_ready=publish, hard_exit_on_stop=True)
+    )
+    idle = TranscriptionClient(socket_path=str(sock))
+    busy = TranscriptionClient(socket_path=str(sock))
+    try:
+        await asyncio.wait_for(published.wait(), T)
+        await idle.connect()
+        await busy.connect()
+        await busy.send_audio(b"\x00\x00" * 800)
+        await busy.commit()
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.wait_for(serving, T)
+    finally:
+        asyncio.get_running_loop().remove_signal_handler(signal.SIGTERM)
+        asyncio.get_running_loop().remove_signal_handler(signal.SIGINT)
+        for c in (idle, busy):
+            try:
+                await c.close()
+            except Exception:
+                pass
+    (srv,) = ready_srv
+    assert exits == []
+    assert srv.live_work_count == 0 and srv.live_work_reasons == []
+    assert srv.state == "stopped" and not _lock_view(srv, sock)
+
+
+@pytest.mark.parametrize("path", ["stop-during-step", "after-shutdown"])
+async def test_both_hard_exits_share_one_routine(monkeypatch, path):
+    """The two hard exits are one routine with explicit parameters: a stop
+    during a step runs ``abort_sync`` and exits 0; live work left after
+    ``shutdown()`` with ``serve`` failing skips ``abort_sync``, reports the
+    failure to ``on_fatal`` and exits 1."""
+
+    class Exited(BaseException):
+        pass
+
+    def fake_exit(code):
+        raise Exited(code)
+
+    monkeypatch.setattr(S.os, "_exit", fake_exit)
+    aborts, fatals = [], []
+    monkeypatch.setattr(TranscriptionServer, "abort_sync", lambda self: aborts.append(self))
+    gate = asyncio.Event()
+
+    async def ready(server):
+        if path == "after-shutdown":
+            server._begin_work()  # live work that outlives shutdown()
+            raise ValueError("warm-up failed")
+        server_stop()
+        await gate.wait()
+
+    def server_stop():
+        import os
+        import signal
+
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    try:
+        with pytest.raises(Exited) as info:
+            await asyncio.wait_for(
+                S.serve(
+                    Gated(),
+                    host="127.0.0.1",
+                    port=0,
+                    install_signal_handlers=path == "stop-during-step",
+                    ready=ready,
+                    hard_exit_on_stop=True,
+                    on_fatal=fatals.append,
+                ),
+                T,
+            )
+    finally:
+        gate.set()
+        if path == "stop-during-step":
+            import signal
+
+            asyncio.get_running_loop().remove_signal_handler(signal.SIGTERM)
+            asyncio.get_running_loop().remove_signal_handler(signal.SIGINT)
+    if path == "stop-during-step":
+        assert info.value.args == (0,) and len(aborts) == 1 and fatals == []
+    else:
+        assert info.value.args == (1,) and aborts == []
+        assert [type(f) for f in fatals] == [ValueError]
+
+
+def test_serve_uses_only_the_public_server_api():
+    """Architecture: ``serve`` is the reference embedder loop, so it must not
+    reach into ``TranscriptionServer`` privates; and the ledger has one
+    removal path (``_end_work``)."""
+    import inspect
+    import re
+
+    assert not re.search(r"\bserver\._", inspect.getsource(S.serve))
+    src = inspect.getsource(TranscriptionServer)
+    pops = [m.start() for m in re.finditer(r"_live_work\.pop\(", src)]
+    end_work = src.index("def _end_work")
+    assert len(pops) == 1 and src.index("def ", end_work + 1) > pops[0] > end_work
+
+
+async def test_adopt_kind_is_restricted_and_stuck_is_optional():
+    srv = TranscriptionServer(EchoBackend(), ServerConfig(host="127.0.0.1", port=0))
+    fut = asyncio.get_running_loop().create_future()
+    with pytest.raises(ValueError):
+        srv.adopt(fut, kind="session")
+    srv.adopt(fut, stuck=False, kind="readiness")
+    assert srv.live_work_reasons == ["1 readiness steps"] and srv.stuck_work_count == 0
+    srv.adopt(fut)
+    assert srv.live_work_count == 1 and srv.stuck_work_count == 1
+    fut.set_result(None)
+    await asyncio.sleep(0)
+    assert srv.live_work_count == 0
+
+
 async def test_serve_rejects_on_fatal_without_hard_exit():
     b = Gated()
     with pytest.raises(S.ConfigError, match="hard_exit_on_stop"):

@@ -414,6 +414,10 @@ _TRANSITIONS: dict[_State, frozenset[_State]] = {
 # only place that does, and it refuses while any live work remains.
 _UNLOCKED_STATES = frozenset({_State.NEW, _State.STOPPED})
 
+# The kinds a caller may hand the server through ``adopt``. The server's own
+# kinds are not adoptable: ``session`` entries are cancelled by the drain.
+_ADOPTABLE_KINDS = frozenset({"adopted", "readiness"})
+
 # How ``_live_reasons`` names each kind of live work.
 _WORK_LABELS = {
     "listener": "listener bound",
@@ -503,6 +507,22 @@ class TranscriptionServer:
     5. Per-attempt state (listener, bound socket inode, backend close task,
        drain task, the shutdown event) is reset in one place,
        ``_reset_attempt``, on every return to ``NEW``.
+
+    Which signal an embedder reads (the one place this is documented):
+
+    - To wait until the server is gone (lock released, nothing running), await
+      ``wait_stopped()``. Nothing else is needed for correctness.
+    - ``live_work_count`` / ``live_work_reasons``: what is still live. It is
+      non-zero throughout ``running`` (the bound listener is an entry), so it
+      is only meaningful after ``shutdown()``: non-zero then means leftovers
+      that keep the lock (what ``serve``'s hard exit reads).
+    - ``stuck_work_count``: diagnostic only (entries that outlived the bound
+      their caller waited for). Never decide anything on it.
+    - ``state`` / ``holds_socket_lock``: for logs and tests.
+    - ``adopt(task)``: hand the server a task of yours that touches it or its
+      backend, so the lock is kept until it ends (``serve`` uses it for its
+      readiness step from creation, ``stuck=False``, and for a startup or
+      readiness step that ignored its cancel).
     """
 
     def __init__(self, backend: TranscriptionBackend, config: ServerConfig) -> None:
@@ -706,12 +726,20 @@ class TranscriptionServer:
         (the lock outlives it) and counts in ``stuck_work_count``."""
         self._track(fut, kind, stuck=True)
 
-    def adopt(self, fut: asyncio.Future) -> None:
-        """Hand the server a task that touches it or its backend and that its
-        caller stopped waiting for (``serve`` does this with a startup or
-        readiness step that ignored cancellation). It counts as live work: the
-        lock is kept until it finishes, and ``stuck_work_count`` includes it."""
-        self._linger(fut, "adopted")
+    def adopt(self, fut: asyncio.Future, *, stuck: bool = True, kind: str = "adopted") -> None:
+        """Hand the server a task that touches it or its backend. It counts as
+        live work until it finishes (the lock is kept meanwhile).
+
+        ``stuck=True`` (default): its caller stopped waiting for it (``serve``
+        does this with a startup or readiness step that ignored cancellation);
+        it is marked stuck (``stuck_work_count``) and its failure is logged.
+        ``stuck=False``: live work from creation while the caller still awaits
+        it (``serve``'s readiness step). Adopting a task again only adds the
+        stuck mark. ``kind`` is ``"adopted"`` or ``"readiness"`` (how
+        ``live_work_reasons`` names it)."""
+        if kind not in _ADOPTABLE_KINDS:
+            raise ValueError(f"adopt(kind=...) must be one of {sorted(_ADOPTABLE_KINDS)}")
+        self._track(fut, kind, stuck=stuck)
 
     async def wait_stopped(self) -> None:
         """Wait until the server holds no lock and runs no work: state
@@ -719,9 +747,9 @@ class TranscriptionServer:
         nothing running).
 
         ``shutdown()`` returning does not always mean that: from ``starting``,
-        or after a drain whose leftovers outlived their bounds
-        (``stuck_work_count``, a backend worker thread), the server sits in
-        ``stopping`` with the lock held. Await this before building a new
+        or after a drain whose leftovers outlived their bounds (any live work
+        left, ``live_work_count``: a session, a backend close, a backend
+        worker thread), the server sits in ``stopping`` with the lock held. Await this before building a new
         server on the same socket, and before closing the event loop: the
         lock is released by a callback on this loop, so closing it with work
         still running keeps the lock until the process exits."""
@@ -776,7 +804,10 @@ class TranscriptionServer:
             await self._unwind_failed_start(backend_started)
             raise
         finally:
-            self._live_work.pop(in_flight, None)
+            # The one removal path. In ``starting`` its re-settle is a no-op
+            # (only ``stopping`` settles), so the transition below still
+            # decides between ``new`` and ``stopping``.
+            self._end_work(in_flight)
             if self._state is _State.STARTING:
                 # Failed start, no shutdown: retryable only if nothing it
                 # started is still running; otherwise wait it out, single-use.
@@ -1009,8 +1040,15 @@ class TranscriptionServer:
         """Entries in the live-work ledger: everything that can still touch
         the socket or the backend, of any kind. The single-server lock is held
         while this is non-zero; ``serve(hard_exit_on_stop=True)`` exits the
-        process when it is non-zero after ``shutdown()``."""
+        process when it is non-zero after ``shutdown()``. Non-zero throughout
+        ``running`` (the bound listener), so read it after ``shutdown()``."""
         return len(self._live_work)
+
+    @property
+    def live_work_reasons(self) -> list[str]:
+        """``live_work_count`` broken down by kind, for logs (e.g.
+        ``["listener bound", "1 session/decode tasks"]``); empty when none."""
+        return self._live_reasons()
 
     @property
     def stuck_work_count(self) -> int:
@@ -1928,9 +1966,9 @@ async def serve(
       during a multi-GB load is honoured at once. Hugging Face downloads resume
       from their ``.incomplete`` blobs next time.
 
-    After a normal ``shutdown()``, session tasks that swallowed cancellation
-    (``stuck_work_count``) would make ``asyncio.run``'s teardown wait on them
-    without a bound. With ``hard_exit_on_stop=True`` the process exits there
+    After a normal ``shutdown()``, any live work left (``live_work_count``:
+    e.g. session tasks that swallowed cancellation) would make
+    ``asyncio.run``'s teardown wait on it without a bound. With ``hard_exit_on_stop=True`` the process exits there
     (``os._exit``: 0 after a requested stop, 1 if ``serve`` was failing); with
     ``False`` they are the caller's, and the single-server lock stays held
     until they finish. ``os._exit`` skips the caller's exception handlers, so a
@@ -1947,7 +1985,9 @@ async def serve(
     it and waits for it at most the drain timeout before ``shutdown()``; one
     that outlives that is handed to the server (``TranscriptionServer.adopt``):
     it keeps the lock until it ends (``live_work_count``; marked in
-    ``stuck_work_count``). The readiness step is live work from creation.
+    ``stuck_work_count``). The readiness step is live work from creation
+    (``adopt(..., stuck=False)``). ``serve`` uses only the
+    server's public API, so an embedder can write the same loop.
     After ``shutdown()``, ``hard_exit_on_stop=True`` exits on any live work
     left (``live_work_count``), of any kind.
     """
@@ -1970,11 +2010,16 @@ async def serve(
         if not stop.done():
             stop.set_result(None)
 
-    def _hard_exit(stage: str) -> None:
-        logger.warning("stt_server: stop requested during %s; exiting", stage)
-        server.abort_sync()
+    def _exit_process(code: int, *, abort: bool, failure: BaseException | None) -> None:
+        """The one hard exit. ``abort``: run ``abort_sync`` first (a stop
+        during a step: ``shutdown()`` never ran). ``failure``: the exception
+        ``os._exit`` would swallow, handed to ``on_fatal`` (else logged)."""
+        if abort:
+            server.abort_sync()
+        if failure is not None:
+            _report_before_hard_exit(failure, on_fatal)
         logging.shutdown()
-        os._exit(0)
+        os._exit(code)
 
     # The startup / readiness step in flight (and its stage), for every exit.
     pending: list[tuple[asyncio.Future, str]] = []
@@ -1999,12 +2044,13 @@ async def serve(
         (readiness; ``start()`` keeps its own in-flight entry)."""
         task = asyncio.ensure_future(coro)
         if track:
-            server._track(task, "readiness")
+            server.adopt(task, stuck=False, kind="readiness")
         pending[:] = [(task, stage)]
         await asyncio.wait({task, stop}, return_when=asyncio.FIRST_COMPLETED)
         if stop.done() and not task.done():
             if hard_exit_on_stop:
-                _hard_exit(stage)
+                logger.warning("stt_server: stop requested during %s; exiting", stage)
+                _exit_process(0, abort=True, failure=None)
             logger.info("stt_server: stop requested during %s; cancelling it", stage)
             await _abandon_step(task)
             return False
@@ -2062,12 +2108,9 @@ async def serve(
                 logger.warning(
                     "stt_server: %d pieces of work outlived shutdown (%s); exiting",
                     server.live_work_count,
-                    ", ".join(server._live_reasons()),
+                    ", ".join(server.live_work_reasons),
                 )
-                if failure is not None:
-                    _report_before_hard_exit(failure, on_fatal)
-                logging.shutdown()
-                os._exit(1 if failure is not None else 0)
+                _exit_process(1 if failure is not None else 0, abort=False, failure=failure)
 
 
 def _report_before_hard_exit(

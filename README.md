@@ -282,7 +282,9 @@ menu bar app. Logging on stderr is unchanged. In addition:
   `TranscriptionServer` is single-use once `shutdown()` was called or a failed
   start left work running (`stopping`); a failed start that returned to `new`
   may be retried. Await `wait_stopped()` before reusing the socket: the lock
-  can outlive `shutdown()`.)
+  can outlive `shutdown()`. Which of the server's other signals to read, and
+  `adopt()` for your own tasks, is documented once in the
+  `TranscriptionServer` class docstring.)
 
 ```bash
 ( sleep 5 ) | uv run python -m stt_server serve --backend echo \

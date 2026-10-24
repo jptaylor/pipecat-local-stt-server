@@ -129,8 +129,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   releases the single-server lock itself. A cancel landing mid-bind no longer
   drops a serving listener.
 - Session tasks that swallow cancellation past the shutdown grace keep the
-  single-server lock until they finish (`TranscriptionServer.stuck_work_count`),
-  and the CLI exits the process instead of hanging in `asyncio.run` teardown.
+  single-server lock until they finish (they are live work,
+  `TranscriptionServer.live_work_count`), and the CLI exits the process
+  instead of hanging in `asyncio.run` teardown.
   That exit no longer swallows a failure in flight (e.g. `backend.close()`
   raising): it is printed and, under `--supervised`, emitted as the `error`
   event, with exit status 1.
@@ -148,14 +149,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend decode thread. As a result: a failed start drains the sessions it
   accepted before giving the lock back; a second cancel mid-bind can no longer
   orphan a listener; `backend.close()` is bounded by the drain timeout (a hung
-  close keeps the lock, counts in `stuck_work_count`, so the CLI exits); a
+  close keeps the lock as live work, so the CLI exits); a
   cancelled `shutdown()` no longer abandons `backend.close()` and later
   callers wait for it; and `serve` keeps a startup/readiness step that ignored
   its cancel as live work (lock held until it ends, its failure logged).
-- Live work is one ledger: the lock decision and `stuck_work_count` (what the
-  CLI's hard exit reads) are views of it, so they can no longer disagree. A
-  bind that finished after a second cancel, its listener's close, and a
-  backend decode thread now count in `stuck_work_count`; sessions are live
+- Live work is one ledger: the lock decision and the CLI's hard exit
+  (`live_work_count`) read it, and `stuck_work_count` is a diagnostic view of
+  it, so they can no longer disagree. A bind that finished after a second
+  cancel, its listener's close, and a backend decode thread are now live
+  work; sessions are live
   work from creation; an orphaned listener keeps the lock until its socket has
   really closed. A failed start that returns to `new` resets every per-attempt
   slot, so a retry closes its backend again (it reused the first attempt's
@@ -186,6 +188,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Alternatives in `SnapshotSpec.required` are a tuple entry, not an `a|b`
   string, and a weight filename read from a Kyutai `config.json` may not
   contain `|`, so such a name can no longer pass `--check` on another file.
+- `serve` uses only `TranscriptionServer`'s public API, so an embedder can
+  write the same loop: `adopt(task, stuck=False, kind="readiness")` registers
+  a step as live work from creation, and `live_work_reasons` (new) names what
+  is live. Which signal to read (`wait_stopped()` to wait; `live_work_count`
+  only after `shutdown()`; `stuck_work_count` diagnostic) is documented once,
+  in the class docstring. Its two hard exits are one routine.
 - `serve`: when `shutdown()` also fails after `serve` was already failing, the
   first failure is raised (and handed to `on_fatal`); the shutdown failure is
   logged instead of replacing it.
