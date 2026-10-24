@@ -388,3 +388,74 @@ async def test_matrix_shutdown(sock, state):
         await _settle(srv, b, pending)
     assert srv.state == "stopped" and not _lock_view(srv, sock)
     assert not sock.exists()
+
+
+# --- the CLI's stuck-task hard exit must not swallow a failure ------------------
+
+
+def test_cli_stuck_task_exit_still_reports_the_failure():
+    """``serve(hard_exit_on_stop=True)`` ``os._exit``s when a session task
+    outlives shutdown, skipping ``_cmd_serve``'s handlers: a failing
+    ``backend.close()`` must still reach stderr and the supervised ``error``
+    event, with exit status 1."""
+    import json
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(
+        """
+        import asyncio, functools, sys
+        from stt_server import __main__ as cli, server as S
+        from stt_server.backend import EchoBackend
+
+        S._CANCEL_GRACE_SECONDS = 0.1
+        S.ServerConfig = functools.partial(S.ServerConfig, drain_timeout_seconds=0.1)
+
+        class BadClose(EchoBackend):
+            async def close(self):
+                raise RuntimeError("metal teardown failed")
+
+        async def stubborn():
+            while True:
+                try:
+                    await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    pass
+
+        async def ready(server):
+            server._active_handlers.add(asyncio.ensure_future(stubborn()))
+
+        cli._make_backend = lambda name, model: BadClose()
+        cli._prepare_ready = ready
+        sys.argv = ["stt_server", "serve", "--supervised", "--host", "127.0.0.1", "--port", "0"]
+        cli.main()
+        """
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        import select
+
+        assert proc.stdout is not None and proc.stdin is not None
+        readable, _, _ = select.select([proc.stdout], [], [], 20)
+        assert readable
+        assert json.loads(proc.stdout.readline())["event"] == "ready"
+        proc.stdin.close()  # supervisor gone -> stop
+        proc.wait(timeout=20)
+        out, err = proc.stdout.read(), proc.stderr.read()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    assert proc.returncode == 1
+    assert b"outlived shutdown" in err
+    assert b"metal teardown failed" in err
+    events = [json.loads(line) for line in out.splitlines() if line.startswith(b"{")]
+    assert events and events[-1]["event"] == "error"
+    assert events[-1]["code"] == "BackendStartError"
+    assert "metal teardown failed" in events[-1]["message"]

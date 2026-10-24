@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -357,6 +358,26 @@ def _cmd_serve(args: argparse.Namespace) -> None:
             raise SystemExit(1) from None
 
 
+def _report_fatal(exc: BaseException, *, supervised: bool) -> None:
+    """Report a serve failure the way ``_run_serve`` / ``_cmd_serve`` would:
+    the stderr line (a one-line message for the expected startup errors, a
+    traceback otherwise) and, under ``--supervised``, the ``error`` event.
+
+    ``serve`` calls it (``on_fatal``) right before its stuck-task ``os._exit``,
+    which skips the handlers below."""
+    if isinstance(exc, (ValueError, OSError, ImportError)):
+        print(f"stt_server: {exc}", file=sys.stderr)
+    else:
+        logging.getLogger("stt_server").error("stt_server: fatal error", exc_info=exc)
+    if supervised:
+        from . import supervise
+
+        code, message = supervise.classify_startup_error(exc)
+        supervise.emit(
+            {"event": "error", "code": code, "message": message, "exc_type": type(exc).__name__}
+        )
+
+
 def _run_serve(args: argparse.Namespace, **serve_kwargs) -> None:
     backend = _make_backend(args.backend, _resolve_model(args.backend, args.model))
     try:
@@ -370,6 +391,9 @@ def _run_serve(args: argparse.Namespace, **serve_kwargs) -> None:
                 # The CLI owns the process: a stop during startup/warm-up exits
                 # at once rather than waiting on an uncancellable model load.
                 hard_exit_on_stop=True,
+                on_fatal=functools.partial(
+                    _report_fatal, supervised=getattr(args, "supervised", False)
+                ),
                 **serve_kwargs,
             )
         )

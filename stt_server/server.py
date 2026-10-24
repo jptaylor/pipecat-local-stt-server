@@ -1543,6 +1543,7 @@ async def serve(
     publish_ready: Callable[[TranscriptionServer], None] | None = None,
     stop_on_stdin_eof: bool = False,
     hard_exit_on_stop: bool = False,
+    on_fatal: Callable[[BaseException], None] | None = None,
 ) -> None:
     """Start the server, wait for shutdown signal, then drain and exit.
 
@@ -1574,7 +1575,10 @@ async def serve(
     without a bound. With ``hard_exit_on_stop=True`` the process exits there
     (``os._exit``: 0 after a requested stop, 1 if ``serve`` was failing); with
     ``False`` they are the caller's, and the single-server lock stays held
-    until they finish.
+    until they finish. ``os._exit`` skips the caller's exception handlers, so a
+    failure propagating at that point is handed to ``on_fatal`` first (the CLI
+    passes its own reporter: stderr message and, under ``--supervised``, the
+    ``error`` event); without ``on_fatal`` it is logged.
     """
     try:
         cfg = ServerConfig(socket_path=socket_path, host=host, port=port, auth_token=auth_token)
@@ -1625,7 +1629,7 @@ async def serve(
         from .supervise import watch_stdin_eof
 
         watch_stdin_eof(loop, _request_stop)
-    failed = False
+    failure: BaseException | None = None
     try:
         # Race startup against stop in every mode: the signal handlers above are
         # installed before ``start()``, so awaiting it bare would defer a
@@ -1638,14 +1642,14 @@ async def serve(
         if publish_ready is not None:
             publish_ready(server)
         await stop
-    except BaseException:
-        failed = True
+    except BaseException as exc:
+        failure = exc
         raise
     finally:
         try:
             await server.shutdown()
-        except BaseException:
-            failed = True
+        except BaseException as exc:
+            failure = exc
             raise
         finally:
             if hard_exit_on_stop and server.stuck_task_count:
@@ -1653,5 +1657,20 @@ async def serve(
                     "stt_server: %d session tasks outlived shutdown; exiting",
                     server.stuck_task_count,
                 )
+                if failure is not None:
+                    _report_before_hard_exit(failure, on_fatal)
                 logging.shutdown()
-                os._exit(1 if failed else 0)
+                os._exit(1 if failure is not None else 0)
+
+
+def _report_before_hard_exit(
+    exc: BaseException, on_fatal: Callable[[BaseException], None] | None
+) -> None:
+    """Surface the failure ``os._exit`` is about to swallow (best-effort)."""
+    try:
+        if on_fatal is not None and isinstance(exc, Exception):
+            on_fatal(exc)
+        else:
+            logger.error("stt_server: fatal error", exc_info=exc)
+    except Exception:  # noqa: BLE001 -- we are exiting regardless
+        logger.exception("stt_server: reporting the fatal error failed")
