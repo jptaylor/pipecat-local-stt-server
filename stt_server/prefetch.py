@@ -99,32 +99,31 @@ def is_local_model(model: str) -> bool:
     return model.startswith(("/", "./", "../", "~")) or Path(model).expanduser().exists()
 
 
-def _entry(backend: str):
-    from .backends import BACKENDS
-
-    try:
-        return BACKENDS[backend]
-    except KeyError:
-        raise ConfigError(f"unknown backend: {backend!r}") from None
+def _module_specs(loaded, model: str | None) -> list[SnapshotSpec]:
+    """The imported backend module's ``prefetch_specs(model)`` (none for echo)."""
+    if loaded.module is None:
+        return []  # echo: no model
+    return list(loaded.module.prefetch_specs(model))
 
 
 def specs_for(backend: str, model: str | None) -> list[SnapshotSpec]:
-    """Every snapshot ``backend`` needs to start ``model`` without the network."""
+    """Every snapshot ``backend`` needs to start ``model`` without the network.
+
+    An unknown ``backend`` raises ``ConfigError`` (from ``import_backend``)."""
     from .backends import import_backend
 
-    _entry(backend)  # unknown name -> ConfigError
-    module = import_backend(backend)
-    if module is None:
-        return []  # echo: no model
-    return list(module.prefetch_specs(model))
+    return _module_specs(import_backend(backend), model)
 
 
 def local_specs_for(backend: str, model: str) -> list[SnapshotSpec]:
     """Attach an explicit local directory to the backend's structural specs."""
-    if not _entry(backend).local_model_paths:
+    from .backends import import_backend
+
+    loaded = import_backend(backend)
+    if not loaded.entry.local_model_paths:
         raise ConfigError(f"the {backend} backend does not support local model paths")
     path = Path(model).expanduser()
-    return [replace(spec, local_path=str(path)) for spec in specs_for(backend, model)]
+    return [replace(spec, local_path=str(path)) for spec in _module_specs(loaded, model)]
 
 
 # --- patchable seams -------------------------------------------------------------

@@ -16,6 +16,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from types import ModuleType
 
+from ..errors import ConfigError
+
 # Default model per backend: single definitions, re-exported by each backend
 # module (``backends.parakeet.DEFAULT_PARAKEET_MODEL`` etc.).
 DEFAULT_MLX_MODEL = "mlx-community/whisper-large-v3-turbo"
@@ -58,16 +60,37 @@ BACKENDS: dict[str, BackendEntry] = {
 }
 
 
-def import_backend(name: str) -> ModuleType | None:
-    """Import the module behind ``--backend name`` (``None`` for echo).
+@dataclass(frozen=True)
+class LoadedBackend:
+    """A registry entry with its module imported (``import_backend``'s result)."""
 
-    The one place that looks a name up and imports its module lazily, for the
-    CLI constructor and ``prefetch``. Raises ``KeyError`` for an unknown name;
-    each caller turns that into its own error.
+    name: str
+    entry: BackendEntry
+    #: The imported backend module, or ``None`` for the built-in echo backend.
+    module: ModuleType | None
+
+    @property
+    def cls(self) -> type | None:
+        """The backend class (``None`` for echo)."""
+        if self.module is None:
+            return None
+        return getattr(self.module, self.entry.class_name)
+
+
+def import_backend(name: str) -> LoadedBackend:
+    """Look ``--backend name`` up and import its module lazily.
+
+    The one registry lookup for the CLI constructor and ``prefetch``: callers
+    read the entry, module and class from the result instead of indexing
+    ``BACKENDS`` again. An unknown name raises :class:`~stt_server.errors.ConfigError`
+    (the CLI boundary turns it into its exit message / error event).
     """
-    entry = BACKENDS[name]
+    try:
+        entry = BACKENDS[name]
+    except KeyError:
+        raise ConfigError(f"unknown backend: {name!r}") from None
     if entry.module is None:
-        return None
+        return LoadedBackend(name, entry, None)
     import importlib
 
-    return importlib.import_module(entry.module)
+    return LoadedBackend(name, entry, importlib.import_module(entry.module))

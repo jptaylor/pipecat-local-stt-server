@@ -35,6 +35,7 @@ from .backend import EchoBackend
 from .backends import BACKENDS, import_backend
 from .backends import DEFAULT_MLX_MODEL as _DEFAULT_MLX_MODEL  # noqa: F401 (compat)
 from .env import env_first
+from .errors import ConfigError
 from .server import serve
 
 # ``TranscriptionClient`` and ``protocol`` are imported lazily inside the
@@ -52,12 +53,12 @@ def _make_backend(name: str, model: str | None):
     surfaces fast in ``start()``, not at construction.
     """
     try:
-        module = import_backend(name)
-    except KeyError:
-        raise SystemExit(f"unknown backend: {name}") from None
-    if module is None:
+        cls = import_backend(name).cls
+    except ConfigError as exc:  # unknown name: the CLI's exit message
+        raise SystemExit(str(exc)) from None
+    if cls is None:
         return EchoBackend()
-    return getattr(module, BACKENDS[name].class_name)(model=model)
+    return cls(model=model)
 
 
 # Every ``--backend`` name; shared by ``serve`` and ``prefetch``.
@@ -524,10 +525,10 @@ def main() -> None:
     p_serve = subparsers.add_parser("serve", help="run the server (default)")
     _add_endpoint_flags(p_serve)
     p_serve.add_argument("--backend", choices=BACKEND_CHOICES, default="echo")
-    # Default is None so ``_resolve_model`` can apply a backend-aware fallback
-    # (Whisper repo for ``mlx``, ``DEFAULT_PARAKEET_MODEL`` for ``parakeet``,
-    # ``DEFAULT_NEMOTRON_MODEL`` for ``nemotron``). An explicit value always
-    # wins and is passed through verbatim.
+    # Default is None so ``_resolve_model`` applies the backend's own default,
+    # ``backends.BACKENDS[backend].default_model`` (the registry is the only
+    # source; ``None`` for echo). An explicit value always wins and is passed
+    # through verbatim.
     p_serve.add_argument("--model", default=None)
     p_serve.add_argument("--log-level", default="INFO")
     p_serve.add_argument(

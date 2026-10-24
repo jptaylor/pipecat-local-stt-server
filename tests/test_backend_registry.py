@@ -80,18 +80,29 @@ def test_model_default_comes_only_from_the_registry():
 
 
 def test_import_backend_is_the_single_lookup(monkeypatch):
+    """One lookup returns everything callers need (entry, module, class); an
+    unknown name is one ``ConfigError``, translated only at the CLI boundary."""
     from stt_server import backends as B
+    from stt_server.errors import ConfigError
 
-    assert B.import_backend("echo") is None
-    with pytest.raises(KeyError):
+    echo = B.import_backend("echo")
+    assert echo.module is None and echo.cls is None and echo.entry is BACKENDS["echo"]
+    with pytest.raises(ConfigError, match="unknown backend"):
         B.import_backend("nope")
+    with pytest.raises(ConfigError, match="unknown backend"):
+        PF.specs_for("nope", None)
+    with pytest.raises(SystemExit, match="unknown backend"):
+        M._make_backend("nope", None)
     seen = []
     real = B.import_backend
     monkeypatch.setattr(B, "import_backend", lambda n: seen.append(n) or real(n))
     monkeypatch.setattr(M, "import_backend", B.import_backend)
+    # Callers must not re-index the registry after the lookup.
+    monkeypatch.setattr(M, "BACKENDS", {})
     M._make_backend("echo", None)
     PF.specs_for("echo", None)
-    assert seen == ["echo", "echo"]
+    PF.local_specs_for("echo", "/tmp/x")
+    assert seen == ["echo", "echo", "echo"]
 
 
 def test_abort_backend_uses_the_abortable_protocol():

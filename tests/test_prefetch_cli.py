@@ -428,8 +428,8 @@ def test_local_model_uses_backend_required_patterns(tmp_path, monkeypatch, capsy
     (model / "sentinel.bin").write_bytes(b"ok")
     monkeypatch.setattr(
         PF,
-        "specs_for",
-        lambda backend, selected: [PF.SnapshotSpec(selected, required=("sentinel.bin",))],
+        "_module_specs",
+        lambda loaded, selected: [PF.SnapshotSpec(selected, required=("sentinel.bin",))],
     )
 
     code, events, _ = _run(
