@@ -95,17 +95,10 @@ def test_supervised_stop_during_blocked_warmup_exits_without_ready(stop_kind):
         import threading
 
         from stt_server.backend import EchoBackend
-        from stt_server.server import TranscriptionServer, serve
+        from stt_server.server import serve
 
-        async def start_without_listener(self):
-            return None
-
-        async def shutdown_without_listener(self):
-            return None
-
-        TranscriptionServer.start = start_without_listener
-        TranscriptionServer.shutdown = shutdown_without_listener
-
+        # The real start(): readiness only ever runs on a ``running`` server
+        # (a stubbed start would leave it ``new``, where adopt() is refused).
         async def blocked_ready(server):
             os.write(2, b"warmup-blocked\\n")
             await asyncio.to_thread(threading.Event().wait)
