@@ -126,7 +126,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   releases the single-server lock itself. A cancel landing mid-bind no longer
   drops a serving listener.
 - Session tasks that swallow cancellation past the shutdown grace keep the
-  single-server lock until they finish (`TranscriptionServer.stuck_task_count`),
+  single-server lock until they finish (`TranscriptionServer.stuck_work_count`),
   and the CLI exits the process instead of hanging in `asyncio.run` teardown.
   That exit no longer swallows a failure in flight (e.g. `backend.close()`
   raising): it is printed and, under `--supervised`, emitted as the `error`
@@ -145,14 +145,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend decode thread. As a result: a failed start drains the sessions it
   accepted before giving the lock back; a second cancel mid-bind can no longer
   orphan a listener; `backend.close()` is bounded by the drain timeout (a hung
-  close keeps the lock, counts in `stuck_task_count`, so the CLI exits); a
+  close keeps the lock, counts in `stuck_work_count`, so the CLI exits); a
   cancelled `shutdown()` no longer abandons `backend.close()` and later
   callers wait for it; and `serve` keeps a startup/readiness step that ignored
   its cancel as live work (lock held until it ends, its failure logged).
-- Live work is one ledger: the lock decision and `stuck_task_count` (what the
+- Live work is one ledger: the lock decision and `stuck_work_count` (what the
   CLI's hard exit reads) are views of it, so they can no longer disagree. A
   bind that finished after a second cancel, its listener's close, and a
-  backend decode thread now count in `stuck_task_count`; sessions are live
+  backend decode thread now count in `stuck_work_count`; sessions are live
   work from creation; an orphaned listener keeps the lock until its socket has
   really closed. A failed start that returns to `new` resets every per-attempt
   slot, so a retry closes its backend again (it reused the first attempt's

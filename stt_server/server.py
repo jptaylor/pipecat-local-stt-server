@@ -490,9 +490,9 @@ class TranscriptionServer:
        does not reach ``RUNNING``. Every wait on someone else's code (sessions,
        the listener's ``wait_closed``, ``backend.close()``) is bounded; what
        outlives its bound stays in the ledger marked stuck, and
-       ``stuck_task_count`` (what ``serve``'s hard exit reads) counts exactly
+       ``stuck_work_count`` (what ``serve``'s hard exit reads) counts exactly
        those entries -- so after a drain, "lock still held" and
-       ``stuck_task_count > 0`` are the same condition.
+       ``stuck_work_count > 0`` are the same condition.
     5. Per-attempt state (listener, bound socket inode, backend close task,
        drain task, the shutdown event) is reset in one place,
        ``_reset_attempt``, on every return to ``NEW``.
@@ -512,7 +512,7 @@ class TranscriptionServer:
         # close, session / decode tasks (from creation; no other registry), an
         # in-flight start or drain, a backend close, an adopted step, a
         # backend worker thread. Both the lock decision (``_live_reasons``)
-        # and ``stuck_task_count`` are views of it; nothing else counts.
+        # and ``stuck_work_count`` are views of it; nothing else counts.
         self._live_work: dict[object, _Work] = {}
         # True once ``shutdown()`` was called (terminal; not per attempt).
         self._shutdown_requested = False
@@ -663,7 +663,7 @@ class TranscriptionServer:
         """Hand the server a task that touches it or its backend and that its
         caller stopped waiting for (``serve`` does this with a startup or
         readiness step that ignored cancellation). It counts as live work: the
-        lock is kept until it finishes, and ``stuck_task_count`` includes it."""
+        lock is kept until it finishes, and ``stuck_work_count`` includes it."""
         self._linger(fut, "adopted")
 
     async def wait_stopped(self) -> None:
@@ -673,7 +673,7 @@ class TranscriptionServer:
 
         ``shutdown()`` returning does not always mean that: from ``starting``,
         or after a drain whose leftovers outlived their bounds
-        (``stuck_task_count``, a backend worker thread), the server sits in
+        (``stuck_work_count``, a backend worker thread), the server sits in
         ``stopping`` with the lock held. Await this before building a new
         server on the same socket, and before closing the event loop: the
         lock is released by a callback on this loop, so closing it with work
@@ -958,16 +958,18 @@ class TranscriptionServer:
         abort_backend(self._backend, logger)
 
     @property
-    def stuck_task_count(self) -> int:
-        """Tasks still alive after the bound their caller waited for (a session
-        that swallowed or outlived cancellation, a backend ``close()`` past its
-        bound, an adopted startup / readiness step). The lock stays held until
-        they end; ``serve(hard_exit_on_stop=True)`` exits the process on them.
+    def stuck_work_count(self) -> int:
+        """Pieces of work still alive after the bound their caller waited for
+        -- not only tasks: a session that swallowed or outlived cancellation, a
+        backend ``close()`` past its bound, a listener close past its grace, an
+        orphan bind, an adopted startup / readiness step, a backend worker
+        thread behind the ``idle()`` hook (a future, not a task). The lock
+        stays held until they end; ``serve(hard_exit_on_stop=True)`` exits the
+        process on them.
 
         A view of the one live-work ledger: the entries marked as having
-        outlived their bound (also an orphan bind and its listener close, and
-        a backend worker thread behind the ``idle()`` hook). Every live entry
-        left once a drain has ended is one of them."""
+        outlived their bound. Every live entry left once a drain has ended is
+        one of them."""
         return sum(1 for w in self._live_entries() if w.stuck)
 
     async def shutdown(self) -> None:
@@ -995,7 +997,7 @@ class TranscriptionServer:
           ``wait_closed``), plus the close bound (``drain_timeout_seconds``
           again) even when a session task swallows cancellation or ``close()``
           hangs. What is left running -- including any backend decode thread
-          (``idle()`` hook) -- is counted by ``stuck_task_count`` and the
+          (``idle()`` hook) -- is counted by ``stuck_work_count`` and the
           single-server lock stays held until the last of it finishes, so no
           new server can take over the socket while this one's work still
           runs. The CLI (``serve`` with ``hard_exit_on_stop=True``) then exits
@@ -1879,7 +1881,7 @@ async def serve(
       from their ``.incomplete`` blobs next time.
 
     After a normal ``shutdown()``, session tasks that swallowed cancellation
-    (``stuck_task_count``) would make ``asyncio.run``'s teardown wait on them
+    (``stuck_work_count``) would make ``asyncio.run``'s teardown wait on them
     without a bound. With ``hard_exit_on_stop=True`` the process exits there
     (``os._exit``: 0 after a requested stop, 1 if ``serve`` was failing); with
     ``False`` they are the caller's, and the single-server lock stays held
@@ -1892,7 +1894,7 @@ async def serve(
 
     A startup or readiness step that outlives its bounded cancel is handed to
     the server (``TranscriptionServer.adopt``): it keeps the lock until it
-    ends and counts in ``stuck_task_count``.
+    ends and counts in ``stuck_work_count``.
     """
     try:
         if on_fatal is not None and not hard_exit_on_stop:
@@ -1974,10 +1976,10 @@ async def serve(
             failure = exc
             raise
         finally:
-            if hard_exit_on_stop and server.stuck_task_count:
+            if hard_exit_on_stop and server.stuck_work_count:
                 logger.warning(
-                    "stt_server: %d tasks outlived shutdown; exiting",
-                    server.stuck_task_count,
+                    "stt_server: %d pieces of work outlived shutdown; exiting",
+                    server.stuck_work_count,
                 )
                 if failure is not None:
                     _report_before_hard_exit(failure, on_fatal)

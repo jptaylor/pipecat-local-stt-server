@@ -266,7 +266,7 @@ mutation-checked (reverting the fix makes it fail).
   nor let a new server take the path while it might. The bind is shielded so a
   cancel mid-bind cannot drop a serving listener.
 - **Stuck session tasks.** Tasks still alive after the cancel grace keep the
-  single-server lock until the last one finishes (`stuck_task_count`). With
+  single-server lock until the last one finishes (`stuck_work_count`). With
   `hard_exit_on_stop=True` (the CLI) `serve` then `os._exit`s (0 after a
   requested stop, 1 if failing) instead of hanging in `asyncio.run` teardown;
   embedders own such tasks.
@@ -350,7 +350,7 @@ line still reads In Progress, and Requirements say Kyutai local paths report
   `stopping`, single-use, instead of `new`); a second cancel mid-bind tracks the
   bind and closes its listener when it exists; `backend.close()` is one
   server-owned task bounded by the drain timeout (a hung close lingers in
-  `stuck_task_count`, so the CLI hard-exits); the running drain is a
+  `stuck_work_count`, so the CLI hard-exits); the running drain is a
   server-owned task, so a cancelled `shutdown()` caller never abandons the
   close and later callers wait for it; `serve` adopts a startup/readiness step
   that outlived its bounded cancel. Tests in `tests/test_server_lifecycle.py`
@@ -380,10 +380,10 @@ structurally:
   socket inode, close task, drain task, session sets, the ledger's finished
   entries, the shutdown event.
 - **Two ledgers for leftover work.** `_live_work` gated the lock while
-  `_lingering` fed `stuck_task_count` (serve's hard exit), so an orphan bind or
+  `_lingering` fed `stuck_work_count` (serve's hard exit), so an orphan bind or
   an `idle()` future held the lock without counting as stuck. Now one ledger
   (`_live_work: dict[key, _Work(kind, stuck)]`): `_live_reasons()` and
-  `stuck_task_count` are both views of it; the listener and session/decode
+  `stuck_work_count` are both views of it; the listener and session/decode
   tasks (tracked from creation) are entries; an orphan bind, its listener's
   `wait_closed`, a backend worker thread and an adopted step are entered as
   stuck. The orphan listener's lock is released only after its socket really

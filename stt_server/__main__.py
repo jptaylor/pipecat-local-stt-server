@@ -363,7 +363,7 @@ def _report_fatal(exc: BaseException, *, supervised: bool) -> None:
     the stderr line (a one-line message for the expected startup errors, a
     traceback otherwise) and, under ``--supervised``, the ``error`` event.
 
-    ``serve`` calls it (``on_fatal``) right before its stuck-task ``os._exit``,
+    ``serve`` calls it (``on_fatal``) right before its stuck-work ``os._exit``,
     which skips the handlers below."""
     if isinstance(exc, (ValueError, OSError, ImportError)):
         print(f"stt_server: {exc}", file=sys.stderr)
