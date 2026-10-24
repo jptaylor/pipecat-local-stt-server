@@ -179,7 +179,7 @@ async def test_retry_after_a_failed_start_closes_the_backend_again(
 
 async def test_failed_start_resets_every_per_attempt_slot(sock, monkeypatch):
     """Security minor: the bound-socket inode and ``_server`` (and the close
-    task, the shutdown event, the session sets) survived a failed start's
+    task, the shutdown event) survived a failed start's
     return to ``new``, so a retry's drain could act on attempt 1's inode."""
     monkeypatch.setattr(S, "_CANCEL_GRACE_SECONDS", 0.05)
     srv = _server(Gated(), sock, drain_timeout_seconds=0.05)
@@ -199,13 +199,49 @@ async def test_failed_start_resets_every_per_attempt_slot(sock, monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, T)
     assert srv.state == "new" and not _lock_view(srv, sock)
-    assert srv._server is None
-    assert srv._bound_socket_id is None
-    assert srv._close_task is None
-    assert srv._stop_task is None
-    assert not srv._shutdown_event.is_set()
-    assert not srv._live_work
     assert srv.sockets_bound == []
+    _assert_attempt_is_fresh(srv)
+
+
+# Instance fields that deliberately span attempts (with their at-rest value
+# in ``new``). Every OTHER field is per-attempt and must be (re)set by
+# ``_reset_attempt``; a new field must be added to one side or the other.
+_SPANNING = {
+    "_backend": None,  # identity, not compared
+    "_config": None,
+    "_state": S._State.NEW,
+    "_lock_fd": None,
+    "_live_work": {},  # ``_transition`` reaches new only with it empty
+    "_shutdown_requested": False,
+    "_unlocked": True,  # an Event: compared by is_set()
+    "_shutdown_event": False,
+}
+
+
+def _at_rest(value):
+    return value.is_set() if isinstance(value, asyncio.Event) else value
+
+
+def _assert_attempt_is_fresh(srv: TranscriptionServer) -> None:
+    """Architecture minor: a structural guard, not a hand-kept slot list."""
+    fresh = TranscriptionServer(srv.backend, srv.config)
+    assert set(vars(srv)) == set(vars(fresh)), "a slot was created outside __init__"
+    # Every per-attempt slot is assigned by ``_reset_attempt`` itself, so the
+    # reset on a return to ``new`` cannot miss one that __init__ sets.
+    bare = object.__new__(TranscriptionServer)
+    bare._shutdown_event = asyncio.Event()
+    bare._reset_attempt()
+    per_attempt = set(vars(fresh)) - set(_SPANNING)
+    assert set(vars(bare)) - {"_shutdown_event"} == per_attempt, (
+        "per-attempt slots not reset by _reset_attempt: "
+        f"{per_attempt - set(vars(bare))}; or a spanning field missing from _SPANNING: "
+        f"{set(vars(bare)) - per_attempt - {'_shutdown_event'}}"
+    )
+    for name in per_attempt:
+        assert _at_rest(vars(srv)[name]) == _at_rest(vars(fresh)[name]), name
+    for name, rest in _SPANNING.items():
+        if rest is not None or name == "_lock_fd":
+            assert _at_rest(vars(srv)[name]) == rest, name
 
 
 async def test_wait_stopped_is_the_public_lock_free_wait(sock):
