@@ -29,6 +29,7 @@ outcome, so a regression fails instead of hanging.
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 import tempfile
 from pathlib import Path
@@ -187,7 +188,7 @@ async def test_failed_start_resets_every_per_attempt_slot(sock, monkeypatch):
         await asyncio.Event().wait()
 
     async def accept_a_session(listener):
-        srv._active_handlers.add(asyncio.ensure_future(handler()))
+        srv._track(asyncio.ensure_future(handler()), "session")
 
     gate, bound, _ = _slow_tail_bind(monkeypatch, accept_a_session)
     task = asyncio.ensure_future(srv.start())
@@ -203,7 +204,6 @@ async def test_failed_start_resets_every_per_attempt_slot(sock, monkeypatch):
     assert srv._close_task is None
     assert srv._stop_task is None
     assert not srv._shutdown_event.is_set()
-    assert not srv._active_handlers and not srv._active_decodes
     assert not srv._live_work
     assert srv.sockets_bound == []
 
@@ -336,7 +336,7 @@ async def test_cancel_during_drain_keeps_the_lock_while_sessions_run(sock):
             raise
 
     task = asyncio.ensure_future(session())
-    srv._active_handlers.add(task)
+    srv._track(task, "session")
     await asyncio.wait_for(entered.wait(), T)
     try:
         stopping = asyncio.ensure_future(srv.shutdown())
@@ -481,6 +481,110 @@ async def test_second_cancel_during_bind_never_orphans_the_listener(sock, monkey
     assert srv.state == "stopped" and not _lock_view(srv, sock)
 
 
+async def test_orphan_bind_keeps_the_lock_until_its_cleanup_ran(sock, monkeypatch):
+    """Codex high: the ledger dropped a future the moment it was done, before
+    its done-callbacks ran. Another entry ending in the same loop tick then
+    released the lock (and reset the attempt) before the orphan bind's cleanup
+    had closed its listener; the cleanup later unlinked with no lock held.
+
+    Deterministic: the bind finishes a second tracked future right before it
+    returns, so both futures' callbacks are queued in one tick, the other
+    one's first."""
+    real_bind = S.ws_unix_serve
+    gate, bound, listeners = asyncio.Event(), asyncio.Event(), []
+    other: asyncio.Future = asyncio.get_running_loop().create_future()
+
+    async def bind(*a, **k):
+        listener = await real_bind(*a, **k)
+        listeners.append(listener)
+        bound.set()
+        await gate.wait()
+        other.set_result(None)  # queued before the bind task's own callbacks
+        return listener
+
+    monkeypatch.setattr(S, "ws_unix_serve", bind)
+    srv = _server(Gated(), sock)
+    task = asyncio.ensure_future(srv.start())
+    await asyncio.wait_for(bound.wait(), T)
+    task.cancel()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    task.cancel()  # second cancel: the bind is orphaned
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, T)
+    srv._linger(other, "close")  # e.g. a backend close past its bound
+    assert srv.state == "stopping" and _lock_view(srv, sock)
+    at_release = []
+    real_release = srv._release_lock
+
+    def spy_release():
+        if srv._lock_fd is not None:
+            at_release.append((listeners[0].is_serving(), sock.exists()))
+        real_release()
+
+    srv._release_lock = spy_release
+    gate.set()
+    await asyncio.wait_for(srv.wait_stopped(), T)
+    assert at_release == [(False, False)], (
+        "lock released before the orphan listener was closed and unlinked"
+    )
+    assert srv.state == "stopped" and not _lock_view(srv, sock)
+
+
+async def test_every_server_task_is_live_work_until_it_completes(sock):
+    """Codex medium: the listener's ``wait_closed`` task (and before it, the
+    normal bind task) was created outside the ledger, so the lock could be
+    released while websockets' close (and the handshakes it waits for) still
+    ran. Every task the server creates must be in ``_live_work`` from creation
+    until it completes."""
+    import os
+    import sys
+
+    from websockets.asyncio.client import unix_connect
+
+    loop = asyncio.get_running_loop()
+    asyncio_dir = os.path.dirname(asyncio.__file__)
+    created: list[str] = []
+    escaped: list[str] = []
+    srv = _server(EchoBackend(), sock)
+
+    def factory(loop, coro, **kw):
+        task = asyncio.Task(coro, loop=loop, **kw)
+        frame = sys._getframe(1)
+        while frame is not None and frame.f_code.co_filename.startswith(asyncio_dir):
+            frame = frame.f_back
+        if frame is not None and frame.f_code.co_filename == S.__file__:
+            where = frame.f_code.co_name
+            created.append(where)
+
+            def check(t, where=where):  # runs before the ledger's own callback
+                if t not in srv._live_work:
+                    escaped.append(where)
+
+            task.add_done_callback(check)
+        return task
+
+    loop.set_task_factory(factory)
+    try:
+        await srv.start()
+        async with unix_connect(str(sock)) as ws:
+            await asyncio.wait_for(ws.recv(), T)  # server.hello
+            await ws.send(b"\x00\x00" * 1600)
+            await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+            while True:
+                ev = json.loads(await asyncio.wait_for(ws.recv(), T))
+                if ev["type"] == "conversation.item.input_audio_transcription.completed":
+                    break
+            await asyncio.wait_for(srv.shutdown(), T)
+        await asyncio.wait_for(srv.wait_stopped(), T)
+    finally:
+        loop.set_task_factory(None)
+    # bind, decode, the drain, the listener close and the backend close.
+    assert {"_bind", "_on_commit", "shutdown", "_begin_listener_close"} <= set(created), created
+    assert escaped == [], f"tasks that left the ledger before completing: {escaped}"
+    assert srv.state == "stopped" and not _lock_view(srv, sock)
+
+
 @pytest.mark.parametrize("trigger", ["shutdown", "cancel"])
 @pytest.mark.parametrize("session", ["prompt", "stubborn"])
 async def test_failed_start_drains_the_sessions_it_accepted(sock, monkeypatch, trigger, session):
@@ -504,7 +608,7 @@ async def test_failed_start_drains_the_sessions_it_accepted(sock, monkeypatch, t
     async def accept_a_session(listener):
         t = asyncio.ensure_future(handler())
         sessions.append(t)
-        srv._active_handlers.add(t)
+        srv._track(t, "session")
         if trigger == "shutdown":
             await srv.shutdown()
 
@@ -554,8 +658,13 @@ async def test_release_is_refused_while_live_work_remains(sock):
     with pytest.raises(RuntimeError, match="live work remains: listener bound"):
         srv._transition(S._State.STOPPED)
     assert srv.state == "stopping" and _lock_view(srv, sock)
-    srv._close_listener()
-    srv._settle()
+    closer = srv._close_listener()
+    # The bound listener is retired only by registering its close: never a
+    # moment with neither in the ledger.
+    assert srv._live_reasons() == ["1 listener close"]
+    assert srv.state == "stopping" and _lock_view(srv, sock)
+    await asyncio.wait_for(closer, T)
+    await asyncio.wait_for(srv.wait_stopped(), T)
     assert srv.state == "stopped" and not _lock_view(srv, sock)
 
 
@@ -572,7 +681,8 @@ async def test_a_session_is_live_work_from_creation(sock):
         assert "1 session/decode tasks" in srv._live_reasons()
         srv._transition(S._State.STOPPING)  # bypass the drain on purpose
         srv._close_listener()
-        assert srv._live_reasons() == ["1 session/decode tasks"]
+        # The listener's close waits for the handler too (websockets).
+        assert sorted(srv._live_reasons()) == ["1 listener close", "1 session/decode tasks"]
         assert srv.state == "stopping" and _lock_view(srv, sock)
     await asyncio.wait_for(srv.wait_stopped(), T)  # the session's end settles it
     assert srv.state == "stopped" and not _lock_view(srv, sock)
@@ -801,7 +911,7 @@ def test_cli_stuck_task_exit_still_reports_the_failure():
                     pass
 
         async def ready(server):
-            server._active_handlers.add(asyncio.ensure_future(stubborn()))
+            server._track(asyncio.ensure_future(stubborn()), "session")
 
         cli._make_backend = lambda name, model: BadClose()
         cli._prepare_ready = ready

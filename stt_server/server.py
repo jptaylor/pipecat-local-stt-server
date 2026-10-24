@@ -419,8 +419,8 @@ _WORK_LABELS = {
     "session": "session/decode tasks",
     "step": "start/drain steps",
     "close": "backend close",
-    "bind": "orphan bind",
-    "listener-close": "orphan listener close",
+    "bind": "listener bind",
+    "listener-close": "listener close",
     "adopted": "adopted steps",
     "thread": "backend worker thread",
 }
@@ -428,11 +428,14 @@ _WORK_LABELS = {
 
 @dataclass
 class _Work:
-    """One entry of the live-work ledger: what it is, and whether it outlived
-    the bound its caller waited for (``stuck_task_count``)."""
+    """One entry of the live-work ledger: what it is, whether it outlived the
+    bound its caller waited for (``stuck_work_count``), and the cleanup that
+    must run when it completes, before it leaves the ledger (``then``: it
+    registers any successor work first, so the lock never falls between)."""
 
     kind: str
     stuck: bool = False
+    then: Callable[[asyncio.Future], None] | None = None
 
 
 class TranscriptionServer:
@@ -469,13 +472,17 @@ class TranscriptionServer:
        ``STOPPED``; it is taken early in ``STARTING`` and held through
        ``RUNNING`` and ``STOPPING``.
     2. "Live work" is one ledger (``_live_work``; ``_live_reasons`` reads
-       only it): a bound listener not yet closed, a session or decode task
-       (tracked from creation), an in-flight start or drain, a backend
-       ``close()`` in flight, a bind that outlived its start and then its
-       listener's close, an adopted startup / readiness step, or a backend
-       worker thread (the optional ``idle()`` hook: a cancelled decode task can
-       leave its daemon thread behind). Every future in it re-settles the state
-       when it completes.
+       only it; it is also the one registry of session / decode tasks, which
+       the drain waits on and cancels): a listener bind, a bound listener,
+       its close (until websockets' ``wait_closed`` returns), a session or
+       decode task, an in-flight start or drain, a backend ``close()``, an
+       adopted startup / readiness step, or a backend worker thread (the
+       optional ``idle()`` hook: a cancelled decode task can leave its daemon
+       thread behind). Every task the server creates is in it from creation.
+       An entry is live until its OWN cleanup has run (``_retire``), not just
+       until its future is done: that cleanup registers any successor work
+       (an orphan bind's listener close) before the entry leaves, then
+       re-settles the state.
     3. The lock is released only by ``_transition`` into ``NEW`` or
        ``STOPPED``, which refuses while any live work remains. ``STOPPING ->
        STOPPED`` happens as soon as the last live work ends.
@@ -487,7 +494,7 @@ class TranscriptionServer:
        those entries -- so after a drain, "lock still held" and
        ``stuck_task_count > 0`` are the same condition.
     5. Per-attempt state (listener, bound socket inode, backend close task,
-       drain task, session sets, the shutdown event) is reset in one place,
+       drain task, the shutdown event) is reset in one place,
        ``_reset_attempt``, on every return to ``NEW``.
     """
 
@@ -501,9 +508,9 @@ class TranscriptionServer:
         # The single-server lock fd: only ever held here, never handed out.
         self._lock_fd: int | None = None
         # THE live-work ledger (invariant 2): everything that can still touch
-        # the socket or the backend -- the bound listener, session / decode
-        # tasks (from creation), an in-flight start or drain, a backend
-        # close, an orphan bind and its listener close, an adopted step, a
+        # the socket or the backend -- a bind, the bound listener and its
+        # close, session / decode tasks (from creation; no other registry), an
+        # in-flight start or drain, a backend close, an adopted step, a
         # backend worker thread. Both the lock decision (``_live_reasons``)
         # and ``stuck_task_count`` are views of it; nothing else counts.
         self._live_work: dict[object, _Work] = {}
@@ -531,10 +538,8 @@ class TranscriptionServer:
         # The drain of a running server: server-owned, so cancelling one
         # ``shutdown()`` caller never abandons it; every caller waits on it.
         self._stop_task: asyncio.Task | None = None
-        self._active_handlers: set[asyncio.Task] = set()
-        self._active_decodes: set[asyncio.Task] = set()
-        # Only finished futures can be left (their callbacks drop them).
-        self._live_work.clear()
+        # The ledger itself spans attempts: ``_transition`` only reaches
+        # ``NEW`` with it empty, so there is nothing to clear.
         self._shutdown_event.clear()  # a failed start's drain set it
 
     # --- lifecycle ---
@@ -576,13 +581,17 @@ class TranscriptionServer:
             self._unlocked.clear()
 
     def _live_entries(self) -> list[_Work]:
-        """The ledger entries still running (a finished future whose
-        done-callback has not run yet no longer counts)."""
-        return [
-            w
-            for k, w in self._live_work.items()
-            if not (isinstance(k, asyncio.Future) and k.done())
-        ]
+        """Every ledger entry. An entry is live until ITS OWN cleanup has run
+        (``_retire``), not merely until its future is done: a finished future
+        whose done-callback is still queued has not yet registered its
+        successor work (an orphan bind's listener close), so dropping it then
+        would let another entry's end release the lock in between."""
+        return list(self._live_work.values())
+
+    def _sessions(self) -> set[asyncio.Future]:
+        """The session / decode tasks still in the ledger (the one registry of
+        them: the drain waits on and cancels exactly these)."""
+        return {k for k, w in self._live_work.items() if w.kind == "session" and not k.done()}
 
     def _live_reasons(self) -> list[str]:
         """Everything that can still touch the socket or the backend (the one
@@ -609,25 +618,45 @@ class TranscriptionServer:
         self._live_work.pop(key, None)
         self._settle()
 
-    def _track(self, fut: asyncio.Future, kind: str, *, stuck: bool = False) -> None:
-        """Count ``fut`` as live work of ``kind`` until it completes (its done
-        callback re-settles the state). ``stuck``: it already outlived the
-        bound its caller waited for. Callbacks added to ``fut`` before this one
-        run first."""
+    def _track(
+        self,
+        fut: asyncio.Future,
+        kind: str,
+        *,
+        stuck: bool = False,
+        then: Callable[[asyncio.Future], None] | None = None,
+    ) -> None:
+        """Count ``fut`` as live work of ``kind`` until it has completed AND
+        its ``then`` cleanup has run (``_retire``, which re-settles the state).
+        ``stuck``: it already outlived the bound its caller waited for."""
         if fut.done():
             return
         entry = self._live_work.get(fut)
         if entry is None:
             self._live_work[fut] = entry = _Work(kind)
-            fut.add_done_callback(self._end_work)
+            fut.add_done_callback(self._retire)
+        if then is not None:
+            entry.then = then
         if stuck and not entry.stuck:
             entry.stuck = True
             # Nobody awaits it any more: log its failure.
             fut.add_done_callback(_log_leftover_failure)
 
+    def _retire(self, fut: asyncio.Future) -> None:
+        """A tracked future's ONE done-callback: run its cleanup (which
+        registers any successor work), and only then drop it from the ledger
+        and re-settle -- one atomic step, so no other entry's end can release
+        the lock between the two."""
+        entry = self._live_work.get(fut)
+        try:
+            if entry is not None and entry.then is not None:
+                entry.then(fut)
+        finally:
+            self._end_work(fut)
+
     def _linger(self, fut: asyncio.Future, kind: str) -> None:
         """``fut`` outlived the bound its caller waited for: it stays live work
-        (the lock outlives it) and counts in ``stuck_task_count``."""
+        (the lock outlives it) and counts in ``stuck_work_count``."""
         self._track(fut, kind, stuck=True)
 
     def adopt(self, fut: asyncio.Future) -> None:
@@ -760,11 +789,13 @@ class TranscriptionServer:
         by an await, so a cancellation landing there would drop a bound,
         serving listener. Shield it. On cancel, wait for the bind and record
         its listener in ``_server`` (``start()``'s unwind closes it). If that
-        wait is cancelled too, the unfinished bind becomes live work instead
-        (the lock is held until it finishes) and its listener is closed the
-        moment it exists.
+        wait is cancelled too, the unfinished bind stays live work, marked
+        stuck (the lock is held until it finishes), and its listener is closed
+        the moment it exists -- as the bind's own cleanup, before the bind
+        leaves the ledger.
         """
         task = asyncio.ensure_future(coro)
+        self._track(task, "bind")  # live work from creation
         try:
             server = await asyncio.shield(task)
         except asyncio.CancelledError:
@@ -773,10 +804,7 @@ class TranscriptionServer:
                     await asyncio.wait({task})
                 except asyncio.CancelledError:
                     if not task.done():
-                        task.add_done_callback(self._close_orphan_listener)
-                        # After the close callback, which runs first and
-                        # tracks the listener's close before this ends.
-                        self._linger(task, "bind")
+                        self._track(task, "bind", stuck=True, then=self._close_orphan_listener)
                         raise
             if not task.cancelled() and task.exception() is None:
                 self._adopt_listener(task.result())
@@ -792,18 +820,16 @@ class TranscriptionServer:
     def _close_orphan_listener(self, task: asyncio.Future) -> None:
         """A bind that finished after its ``start()`` gave up on it: close it.
 
-        The lock is still held (the bind task is live work), so the inode at
-        the path is this bind's and may be unlinked. ``Server.close()`` only
-        schedules the close of the listening socket, so the close itself
-        (``wait_closed``) is live work too: the lock is released only once the
-        fd is really closed."""
+        Runs as the bind's ``_retire`` cleanup: the bind is still in the
+        ledger, so the lock is held and the inode at the path is this bind's
+        and may be unlinked. ``Server.close()`` only schedules the close of the
+        listening socket, so the close itself (``wait_closed``) is registered
+        as live work here, before the bind leaves the ledger: the lock is
+        released only once the fd is really closed."""
         if task.cancelled() or task.exception() is not None:
             return
-        listener = task.result()
-        listener.close(close_connections=True)
         self._record_bound_socket()
-        self._unlink_own_socket()
-        self._linger(asyncio.ensure_future(listener.wait_closed()), "listener-close")
+        self._begin_listener_close(task.result(), stuck=True)
 
     def _record_bound_socket(self) -> None:
         """Record the (st_dev, st_ino) of the Unix socket this process bound.
@@ -1014,7 +1040,7 @@ class TranscriptionServer:
     def _cancel_sessions(self) -> set[asyncio.Future]:
         """Cancel every live session / decode task (a task already asked to
         cancel is not asked again) and keep it as lingering live work."""
-        live = {t for t in self._active_handlers | self._active_decodes if not t.done()}
+        live = self._sessions()
         for t in live:
             cancelling = getattr(t, "cancelling", None)
             if cancelling is None or not cancelling():
@@ -1029,28 +1055,24 @@ class TranscriptionServer:
         cancellation -- is kept as live work, so the lock outlives it."""
         self._shutdown_event.set()
         draining = self._begin_work()
-        pending: set[asyncio.Future] = set(self._active_handlers | self._active_decodes)
+        pending = self._sessions()
         try:
             await self._drain_and_close(pending, close_backend)
         finally:
             try:
-                self._keep_lock_for_leftover_work(pending, close_backend)
+                self._keep_lock_for_leftover_work(close_backend)
             finally:
                 self._end_work(draining)
 
-    def _keep_lock_for_leftover_work(
-        self, pending: set[asyncio.Future], close_backend: bool
-    ) -> None:
-        """Track everything that can still run after the drain (normal return,
-        failure or cancellation alike), so the lock outlives it.
+    def _keep_lock_for_leftover_work(self, close_backend: bool) -> None:
+        """Mark everything that can still run after the drain (normal return,
+        failure or cancellation alike) as stuck live work, so the lock
+        outlives it.
 
-        Liveness is read from the tasks themselves, never from how far the
-        drain got: a cancel landing in the first drain wait leaves handlers that
-        were never cancelled; cancel them now. A drain cut short before the
-        backend ``close()`` still starts it (unawaited, as live work)."""
-        for t in pending:
-            if not t.done():
-                self._linger(t, "session")
+        Liveness is read from the ledger, never from how far the drain got: a
+        cancel landing in the first drain wait leaves handlers that were never
+        cancelled; cancel them now. A drain cut short before the backend
+        ``close()`` still starts it (unawaited, as live work)."""
         self._cancel_sessions()
         if close_backend and self._close_task is None:
             self._close_task = asyncio.ensure_future(self._backend.close())
@@ -1062,21 +1084,42 @@ class TranscriptionServer:
                 self._linger(self._backend.idle(), "thread")
             except Exception:  # noqa: BLE001 -- best-effort; never skip the lock bookkeeping
                 logger.exception("stt_server: backend idle() failed")
+        # Whatever else is still running (a listener close past its grace, a
+        # bind) has outlived the drain too: one rule, read from the ledger, so
+        # "lock still held" and ``stuck_work_count > 0`` agree after a drain.
+        for key, work in list(self._live_work.items()):
+            if isinstance(key, asyncio.Future) and work.kind != "step":
+                self._linger(key, work.kind)
 
-    def _close_listener(self) -> None:
-        if self._server is not None:
-            # ``close_connections=True`` sends a close frame to every open
-            # socket so handler recv loops exit instead of blocking forever
-            # on an idle client.
-            self._server.close(close_connections=True)
-            # Our inode only (``asyncio`` does not remove a Unix socket file on
-            # close): a stale socket file would otherwise outlive the server.
-            self._unlink_own_socket()
-            # The drain (live work itself) then waits for ``wait_closed``.
-            self._live_work.pop(self._server, None)
+    def _close_listener(self) -> asyncio.Future | None:
+        """Close this attempt's listener; returns its ``wait_closed``, already
+        live work (or None when nothing was bound)."""
+        if self._server is None:
+            return None
+        return self._begin_listener_close(self._server, stuck=False)
+
+    def _begin_listener_close(self, listener: Server, *, stuck: bool) -> asyncio.Future:
+        """Close ``listener`` and hand its close to the ledger.
+
+        ``close_connections=True`` sends a close frame to every open socket so
+        handler recv loops exit instead of blocking forever on an idle client.
+        ``Server.close()`` only schedules the close (websockets' own task then
+        closes the listening socket and waits for every connection handler,
+        including handshakes still running ``process_request``), so that close
+        is live work until ``wait_closed`` returns. The successor (the close)
+        is registered before the predecessor (the bound listener) leaves the
+        ledger: there is no instant with neither."""
+        listener.close(close_connections=True)
+        # Our inode only (``asyncio`` does not remove a Unix socket file on
+        # close): a stale socket file would otherwise outlive the server.
+        self._unlink_own_socket()
+        closer = asyncio.ensure_future(listener.wait_closed())
+        self._track(closer, "listener-close", stuck=stuck)
+        self._live_work.pop(listener, None)
+        return closer
 
     async def _drain_and_close(self, pending: set[asyncio.Future], close_backend: bool) -> None:
-        self._close_listener()
+        closer = self._close_listener()
         if pending:
             # ``asyncio.wait`` (not ``wait_for(gather(...))``): ``wait_for``
             # waits for the cancelled gather to finish unwinding, so a task
@@ -1105,13 +1148,14 @@ class TranscriptionServer:
             # failed task is not reported as "exception never retrieved".
             if t.done() and not t.cancelled():
                 t.exception()
-        if self._server is not None:
+        if closer is not None:
             # ``wait_closed`` also waits for connection handlers; bound it the
-            # same way so a stuck handler cannot hold shutdown.
-            closer = asyncio.ensure_future(self._server.wait_closed())
+            # same way so a stuck handler cannot hold shutdown. Cancelling it
+            # would only end our wait (websockets' close keeps running), so one
+            # that outlives the grace stays live work, stuck, holding the lock.
             _done, stuck = await asyncio.wait({closer}, timeout=_CANCEL_GRACE_SECONDS)
             if stuck:
-                closer.cancel()
+                self._linger(closer, "listener-close")
         if close_backend:
             await self._close_backend()
 
@@ -1191,8 +1235,7 @@ class TranscriptionServer:
     async def _handle_connection(self, ws: ServerConnection) -> None:
         task = asyncio.current_task()
         assert task is not None
-        self._active_handlers.add(task)
-        self._track(task, "session")  # live work from creation
+        self._track(task, "session")  # live work from creation (the one registry)
         state = _SessionState(session_id=_session_id())
         try:
             await self._send(
@@ -1251,13 +1294,8 @@ class TranscriptionServer:
         except websockets.exceptions.ConnectionClosed:
             pass
         finally:
+            # The task's ``_retire`` callback drops it and re-settles.
             await self._teardown_session(ws, state)
-            self._active_handlers.discard(task)
-            self._settle()
-
-    def _decode_done(self, task: asyncio.Task) -> None:
-        self._active_decodes.discard(task)
-        self._settle()
 
     # --- message handlers ---
     async def _handle_text(self, ws: ServerConnection, state: _SessionState, raw: str) -> None:
@@ -1487,9 +1525,7 @@ class TranscriptionServer:
         await self._send(ws, state, payload)
         decode_task = asyncio.create_task(self._run_decode(ws, state, audio, item))
         state.in_flight_task = decode_task
-        self._active_decodes.add(decode_task)
-        decode_task.add_done_callback(self._decode_done)
-        self._track(decode_task, "session")  # live work from creation
+        self._track(decode_task, "session")  # live work from creation (the one registry)
 
     async def _on_clear(
         self,

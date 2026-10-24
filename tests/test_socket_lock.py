@@ -366,7 +366,7 @@ async def test_shutdown_is_bounded_when_a_task_swallows_cancellation(monkeypatch
                     raise
 
     task = asyncio.ensure_future(stubborn())
-    srv._active_handlers.add(task)
+    srv._track(task, "session")
     try:
         await asyncio.wait_for(srv.shutdown(), timeout=3)
     finally:
@@ -530,7 +530,7 @@ async def test_stuck_session_task_keeps_lock_until_it_finishes(short_home, monke
                 pass
 
     task = asyncio.ensure_future(stubborn())
-    srv._active_handlers.add(task)
+    srv._track(task, "session")
     try:
         await asyncio.wait_for(srv.shutdown(), timeout=3)
         assert srv.stuck_task_count == 1
@@ -569,7 +569,7 @@ def test_cli_exits_when_a_session_task_outlives_shutdown():
                     pass
 
         async def ready(server):
-            server._active_handlers.add(asyncio.ensure_future(stubborn()))
+            server._track(asyncio.ensure_future(stubborn()), "session")
 
         def publish(server):
             os.write(1, b"ready\\n")
