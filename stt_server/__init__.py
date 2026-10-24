@@ -24,6 +24,7 @@ from .backend import (
     TranscriptionBackend,
 )
 from .client import TranscriptionClient
+from .errors import ConfigError
 from .protocol import (
     AUDIO_CHANNELS,
     AUDIO_FORMAT,
@@ -52,4 +53,5 @@ __all__ = [
     "TranscriptEvent",
     "EchoBackend",
     "TranscriptionClient",
+    "ConfigError",
 ]

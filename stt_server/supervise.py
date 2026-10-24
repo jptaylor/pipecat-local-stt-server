@@ -37,6 +37,9 @@ from typing import Any, TextIO
 
 # The origin tags live in the stdlib-only ``stt_server.snapshot`` so the backends
 # and ``prefetch`` can set them without importing this module; re-exported here.
+# ``ConfigError`` lives in the stdlib-only ``stt_server.errors`` (the server core
+# and ``prefetch`` raise it without importing this module); re-exported here.
+from .errors import ConfigError, is_config_error
 from .snapshot import DOWNLOAD_PHASE_ATTR as _DOWNLOAD_PHASE_ATTR
 from .snapshot import MODEL_INVALID_ATTR as _MODEL_INVALID_ATTR
 from .snapshot import mark_download_phase, mark_model_invalid
@@ -67,19 +70,6 @@ CODE_BACKEND_START = "BackendStartError"
 CODE_MODEL_INVALID = "ModelInvalidError"
 
 _DOWNLOAD_MODULE_PREFIXES = ("huggingface_hub", "requests", "urllib3", "hf_xet", "httpx")
-# Raised by ``huggingface_hub`` for a malformed repo id / revision before any
-# request: bad input, not a download failure. Recognised by name (lean import).
-_HUB_INPUT_ERROR_NAMES = frozenset({"HFValidationError"})
-
-
-class ConfigError(ValueError):
-    """A rejected endpoint or CLI configuration (``ConfigError`` code).
-
-    Raised by ``ServerConfig``, the socket-directory enforcement and
-    ``prefetch``'s backend/model checks. A ``ValueError`` subclass, so existing
-    ``except ValueError`` callers are unaffected; a plain ``ValueError`` (for
-    example from a model library during warm-up) is NOT a config error.
-    """
 
 
 _channel: TextIO | None = None
@@ -188,9 +178,7 @@ def classify_startup_error(exc: BaseException) -> tuple[str, str]:
     # same builtins from the listener preflight (e.g. a UDS probe's ECONNRESET)
     # are NOT downloads and fall through to ``BackendStartError``.
     for e in chain:
-        if isinstance(e, ConfigError) or (
-            isinstance(e, ValueError) and type(e).__name__ in _HUB_INPUT_ERROR_NAMES
-        ):
+        if is_config_error(e):
             return CODE_CONFIG, message
     in_download_phase = any(getattr(e, _DOWNLOAD_PHASE_ATTR, False) for e in chain)
     for e in chain:

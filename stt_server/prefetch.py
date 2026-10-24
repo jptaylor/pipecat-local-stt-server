@@ -50,7 +50,7 @@ from typing import Any
 # ``SnapshotSpec`` lives in the stdlib-only ``stt_server.snapshot`` (the backends
 # import it from there); re-exported here for existing callers.
 from .snapshot import SnapshotSpec, check_plain_filenames, download_phase, mark_model_invalid
-from .supervise import ConfigError
+from .errors import ConfigError
 
 __all__ = ["SnapshotSpec", "check_spec", "fetch_spec", "run_prefetch", "specs_for"]
 

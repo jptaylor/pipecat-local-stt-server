@@ -109,3 +109,17 @@ def test_abort_backend_uses_the_abortable_protocol():
     abort_backend(b, None)
     abort_backend(EchoBackend(), None)  # no hook: nothing to call
     assert b.aborted == 1
+
+
+def test_config_error_lives_outside_the_cli_layer():
+    """The server core and prefetch raise ``ConfigError`` without importing the
+    supervisor channel; ``supervise.ConfigError`` and the package export are the
+    same class."""
+    code = (
+        "import sys, stt_server.server, stt_server.prefetch, stt_server.backends\n"
+        "assert 'stt_server.supervise' not in sys.modules, 'core imports the CLI layer'\n"
+        "import stt_server, stt_server.errors as E, stt_server.supervise as S\n"
+        "assert stt_server.ConfigError is E.ConfigError is S.ConfigError\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr

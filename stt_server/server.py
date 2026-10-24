@@ -51,7 +51,7 @@ from websockets.asyncio.server import (
 from . import protocol as P
 from ._peercred import peer_uid
 from .backend import BackendStream, EchoBackend, TranscriptionBackend, abort_backend
-from .supervise import ConfigError
+from .errors import ConfigError
 
 # OpenAI Realtime groups errors into a coarse "type" field (e.g.
 # invalid_request_error, server_error, authentication_error) alongside the
