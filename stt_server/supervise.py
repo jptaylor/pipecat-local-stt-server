@@ -32,6 +32,21 @@ import threading
 from collections.abc import Callable, Iterator
 from typing import Any, TextIO
 
+# The origin tags live in the stdlib-only ``stt_server.snapshot`` so the backends
+# and ``prefetch`` can set them without importing this module; re-exported here.
+from .snapshot import DOWNLOAD_PHASE_ATTR as _DOWNLOAD_PHASE_ATTR
+from .snapshot import MODEL_INVALID_ATTR as _MODEL_INVALID_ATTR
+from .snapshot import mark_download_phase, mark_model_invalid
+
+__all__ = [
+    "classify_startup_error",
+    "emit",
+    "json_channel",
+    "mark_download_phase",
+    "mark_model_invalid",
+    "watch_stdin_eof",
+]
+
 logger = logging.getLogger("stt_server")
 
 # Stable ``code`` values for ``{"event": "error"}`` lines (part of the contract).
@@ -41,6 +56,10 @@ CODE_ACCESS_DENIED = "EACCES"
 CODE_MODEL_DOWNLOAD = "ModelDownloadError"
 CODE_CONFIG = "ConfigError"
 CODE_BACKEND_START = "BackendStartError"
+#: The model snapshot is present but unusable (incomplete, corrupt or
+#: incomplete ``config.json``): re-fetching or fixing the local model is the
+#: remedy, not the network.
+CODE_MODEL_INVALID = "ModelInvalidError"
 
 _DOWNLOAD_MODULE_PREFIXES = ("huggingface_hub", "requests", "urllib3", "hf_xet", "httpx")
 
@@ -127,18 +146,6 @@ def _walk(exc: BaseException) -> Iterator[BaseException]:
         cur = cur.__cause__ or cur.__context__
 
 
-_DOWNLOAD_PHASE_ATTR = "_stt_download_phase"
-
-
-def mark_download_phase(exc: BaseException) -> None:
-    """Tag ``exc`` as raised while a model download was running, so a bare
-    ``ConnectionError``/``TimeoutError`` is classified as ``ModelDownloadError``."""
-    try:
-        setattr(exc, _DOWNLOAD_PHASE_ATTR, True)
-    except AttributeError:  # exotic exception without a __dict__: stay unmarked
-        pass
-
-
 def classify_startup_error(exc: BaseException) -> tuple[str, str]:
     """Map a fatal startup exception to ``(code, human message)``.
 
@@ -168,6 +175,8 @@ def classify_startup_error(exc: BaseException) -> tuple[str, str]:
             in_download_phase and isinstance(e, (ConnectionError, TimeoutError))
         ):
             return CODE_MODEL_DOWNLOAD, f"model download failed: {e}"
+    if any(getattr(e, _MODEL_INVALID_ATTR, False) for e in chain):
+        return CODE_MODEL_INVALID, f"model snapshot is unusable: {message}"
     if isinstance(exc, ValueError):
         # ServerConfig and socket-directory enforcement reject bad endpoints
         # with ValueError before anything binds.

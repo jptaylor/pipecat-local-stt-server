@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from typing import AsyncGenerator
+from collections.abc import AsyncGenerator
 
 import numpy as np
 
@@ -25,8 +25,9 @@ from stt_server.env import env_bool_first, env_float_first
 from stt_server.text_quality import dominant_unigram_ratio, is_degenerate
 
 from ..backend import TranscriptEvent
+from ..snapshot import SnapshotSpec
 from . import DEFAULT_MLX_MODEL
-from ._thread_util import DecodeGuardMixin, run_in_daemon_thread
+from ._thread_util import DecodeGuardMixin
 
 logger = logging.getLogger("stt_server.backends.mlx")
 
@@ -73,7 +74,7 @@ class _MLXStream:
         language: str | None,
         decode_lock: asyncio.Lock,
         thread_lock: threading.Lock,
-        backend: "MLXWhisperBackend",
+        backend: MLXWhisperBackend,
     ) -> None:
         self._model = model
         self._language = language
@@ -104,19 +105,21 @@ class _MLXStream:
         async with self._decode_lock:
             if self._cancelled:
                 return
-            # Mark the decode in-flight BEFORE spawning the daemon thread
-            # so ``backend.close()`` can observe it immediately. The
-            # daemon thread (``_decode_sync``) owns the decrement in a
+            # ``_run_guarded_decode`` marks the decode in-flight BEFORE
+            # spawning the daemon thread so ``backend.close()`` can observe it
+            # immediately (and undoes the mark if the thread cannot start).
+            # The daemon thread (``_decode_sync``) owns the decrement in a
             # finally block, so the marker survives asyncio cancellation
             # of this awaiter — the daemon thread is what shutdown must
             # actually drain, not this coroutine.
-            self._backend._mark_inflight_start()
             # If the caller's task is cancelled mid-decode, the await here
             # raises CancelledError and unwinds; the daemon thread keeps
             # running (but holds ``_thread_lock`` until it finishes) and is
             # reaped by the OS at process exit. Shutdown is bounded
             # regardless of MLX decode duration.
-            self._result = await run_in_daemon_thread(self._decode_sync, thread_name="mlx-decode")
+            self._result = await self._backend._run_guarded_decode(
+                self._decode_sync, thread_name="mlx-decode"
+            )
 
     async def cancel(self) -> None:
         self._cancelled = True
@@ -286,7 +289,7 @@ class MLXWhisperBackend(DecodeGuardMixin):
                 f"({missing}) — run: uv sync --extra mlx --inexact"
             ) from exc
 
-    async def open_stream(self, *, language: str | None = None) -> "_MLXStream":
+    async def open_stream(self, *, language: str | None = None) -> _MLXStream:
         return _MLXStream(self._model, language, self._decode_lock, self._thread_lock, self)
 
     async def close(self) -> None:
@@ -304,10 +307,8 @@ class MLXWhisperBackend(DecodeGuardMixin):
         await self._drain_inflight("mlx_whisper", logger)
 
 
-def prefetch_specs(model: str | None) -> list:
+def prefetch_specs(model: str | None) -> list[SnapshotSpec]:
     """Snapshots ``python -m stt_server prefetch --backend mlx`` fetches:
     ``mlx_whisper`` loads with an unfiltered ``snapshot_download``, so the whole
     repo (``config.json`` plus ``weights.safetensors``/``weights.npz``)."""
-    from ..prefetch import SnapshotSpec
-
     return [SnapshotSpec(model or DEFAULT_MLX_MODEL, required=("config.json", "weights.*"))]

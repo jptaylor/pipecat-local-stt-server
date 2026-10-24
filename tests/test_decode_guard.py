@@ -72,3 +72,37 @@ def test_cli_and_backend_share_one_default_mlx_model():
 
     assert cli._DEFAULT_MLX_MODEL is DEFAULT_MLX_MODEL
     assert MLXWhisperBackend().model == DEFAULT_MLX_MODEL
+
+
+@pytest.mark.parametrize("cls", BACKENDS)
+def test_thread_start_failure_does_not_leak_the_inflight_count(cls, monkeypatch):
+    """The count is taken before the daemon thread starts; if ``Thread.start``
+    raises, the decode function (which owns the decrement) never runs."""
+    import threading
+
+    backend = cls()
+
+    def boom(self):
+        raise RuntimeError("can't start new thread")
+
+    async def run():
+        monkeypatch.setattr(threading.Thread, "start", boom)
+        with pytest.raises(RuntimeError):
+            await backend._run_guarded_decode(lambda: "x", thread_name="t")
+        monkeypatch.undo()
+        assert backend._inflight_count == 0
+        assert backend._wait_inflight_drained(0) is True
+
+        def decode():
+            try:
+                return "ok"
+            finally:
+                backend._mark_inflight_end()
+
+        assert await backend._run_guarded_decode(decode, thread_name="t") == "ok"
+        assert backend._inflight_count == 0
+
+    try:
+        asyncio.run(run())
+    finally:
+        getattr(backend, "abort", lambda: None)()

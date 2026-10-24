@@ -59,10 +59,12 @@ class DecodeGuardMixin:
 
     ``_decode_lock`` (asyncio) serialises decodes across sessions on the event
     loop; ``_thread_lock`` (threading) serialises the actual MLX/Metal work on
-    the daemon thread. The in-flight counter is incremented by the stream
-    before the daemon thread starts and decremented in a ``finally`` by the
-    stream, so ``close()`` cannot observe "nothing in flight" between
-    ``Thread.start()`` and the thread's first statement.
+    the daemon thread. The in-flight counter is incremented by
+    ``_run_guarded_decode`` before the daemon thread starts and decremented in a
+    ``finally`` by the stream's decode function (or by ``_run_guarded_decode``
+    itself when the thread fails to start), so ``close()`` cannot observe
+    "nothing in flight" between ``Thread.start()`` and the thread's first
+    statement.
 
     Call ``_init_decode_guards()`` from ``__init__``.
     """
@@ -82,6 +84,24 @@ class DecodeGuardMixin:
             self._inflight_count -= 1
             if self._inflight_count == 0:
                 self._inflight_cond.notify_all()
+
+    def _run_guarded_decode(
+        self, func: Callable[[], _T], *, thread_name: str
+    ) -> "asyncio.Future[_T]":
+        """Mark a decode in flight, then run ``func`` on a daemon thread.
+
+        ``func`` must call ``_mark_inflight_end()`` in a ``finally``. If the
+        thread cannot be started (``Thread.start`` raising, e.g. the OS thread
+        limit), ``func`` never runs, so the mark is undone here -- otherwise the
+        count would never return to zero and every later ``close()`` would wait
+        out its full drain window and report a stuck decode.
+        """
+        self._mark_inflight_start()
+        try:
+            return run_in_daemon_thread(func, thread_name=thread_name)
+        except BaseException:
+            self._mark_inflight_end()
+            raise
 
     def _wait_inflight_drained(self, timeout_s: float) -> bool:
         with self._inflight_cond:

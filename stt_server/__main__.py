@@ -30,11 +30,10 @@ from pathlib import Path
 
 from .backend import EchoBackend
 
-# Whisper repo default for ``--backend mlx``: single definition in
-# ``backends/__init__.py`` (stdlib-only, so this stays lean). ``parakeet``'s
-# default lives in ``backends/parakeet.py`` and is imported lazily (it would
-# otherwise pull the parakeet module at every launch).
-from .backends import DEFAULT_MLX_MODEL as _DEFAULT_MLX_MODEL
+# The backend registry (``backends/__init__.py``) is stdlib-only: reading it
+# imports no backend module, so the serve path stays lean at every launch.
+from .backends import BACKENDS
+from .backends import DEFAULT_MLX_MODEL as _DEFAULT_MLX_MODEL  # noqa: F401 (compat)
 from .env import env_first
 from .server import serve
 
@@ -44,43 +43,27 @@ from .server import serve
 
 
 def _make_backend(name: str, model: str):
-    if name == "echo":
+    """Construct the ``--backend`` named ``name`` (see ``backends.BACKENDS``).
+
+    The backend module is imported lazily, here, so a base install without an
+    optional extra still constructs the others. No backend module imports its
+    extra at module load (``parakeet_mlx``, ``mlx_audio``, ``moshi_mlx`` are
+    imported only inside ``start()``/``_get_model``), so a missing extra
+    surfaces fast in ``start()``, not at construction.
+    """
+    entry = BACKENDS.get(name)
+    if entry is None:
+        raise SystemExit(f"unknown backend: {name}")
+    if entry.module is None:
         return EchoBackend()
-    if name == "mlx":
-        from .backends.mlx_whisper import MLXWhisperBackend
+    import importlib
 
-        return MLXWhisperBackend(model=model)
-    if name == "parakeet":
-        # Lazy import so a base install without the ``parakeet``
-        # extra still constructs ``echo``/``mlx`` backends. ``parakeet.py``
-        # imports ``parakeet_mlx`` only inside ``start()`` / ``_get_model``,
-        # never at module load, so this import does NOT transitively pull
-        # ``parakeet_mlx`` — the missing-extra failure surfaces fast in
-        # ``start()``, not here at construction.
-        from .backends.parakeet import ParakeetBackend
-
-        return ParakeetBackend(model=model)
-    if name == "nemotron":
-        # Lazy import so a base install without the ``nemotron`` extra still
-        # constructs ``echo``/``mlx`` backends. ``nemotron.py`` imports
-        # ``mlx_audio`` only inside ``start()`` / ``_get_model``, never at
-        # module load, so this import does NOT transitively pull ``mlx_audio``
-        # — the missing-extra failure surfaces fast in ``start()``, not here at
-        # construction.
-        from .backends.nemotron import NemotronBackend
-
-        return NemotronBackend(model=model)
-    if name == "kyutai":
-        # Lazy like the others: ``kyutai.py`` imports ``moshi_mlx`` only inside
-        # ``start()``.
-        from .backends.kyutai import KyutaiBackend
-
-        return KyutaiBackend(model=model)
-    raise SystemExit(f"unknown backend: {name}")
+    cls = getattr(importlib.import_module(entry.module), entry.class_name)
+    return cls(model=model)
 
 
 # Every ``--backend`` name; shared by ``serve`` and ``prefetch``.
-BACKEND_CHOICES = ("echo", "mlx", "parakeet", "nemotron", "kyutai")
+BACKEND_CHOICES = tuple(BACKENDS)
 
 
 def _resolve_model(backend: str, model: str | None) -> str:
@@ -90,24 +73,15 @@ def _resolve_model(backend: str, model: str | None) -> str:
     server-side ``--backend`` is the trust anchor; pointing a backend at a
     mismatched repo id fails fast in ``start()``/decode, and classifying a
     repo id as "whisper" vs "parakeet" would need a brittle string heuristic).
-    When ``--model`` is unset the default is backend-aware: ``parakeet`` uses
-    ``DEFAULT_PARAKEET_MODEL`` and ``nemotron`` uses ``DEFAULT_NEMOTRON_MODEL``
-    rather than the Whisper repo.
+    When ``--model`` is unset the default is the backend's own
+    ``BACKENDS[backend].default_model`` (e.g. ``DEFAULT_PARAKEET_MODEL`` for
+    ``parakeet``), falling back to the Whisper repo for a backend with none.
     """
     if model is not None:
         return model
-    if backend == "parakeet":
-        from .backends.parakeet import DEFAULT_PARAKEET_MODEL
-
-        return DEFAULT_PARAKEET_MODEL
-    if backend == "nemotron":
-        from .backends.nemotron import DEFAULT_NEMOTRON_MODEL
-
-        return DEFAULT_NEMOTRON_MODEL
-    if backend == "kyutai":
-        from .backends.kyutai import DEFAULT_KYUTAI_MODEL
-
-        return DEFAULT_KYUTAI_MODEL
+    entry = BACKENDS.get(backend)
+    if entry is not None and entry.default_model is not None:
+        return entry.default_model
     return _DEFAULT_MLX_MODEL
 
 
@@ -293,16 +267,12 @@ async def _warm(backend) -> None:
 async def _prepare_ready(server) -> None:
     """Warm the backend before the supervised ready event is published.
 
-    Warm-up is where the lazy model load (and so any first download) happens, so
-    a failure here is tagged as the download phase for ``classify_startup_error``.
+    Warm-up runs the lazy model load (and so any first download) AND a decode.
+    It does not tag failures itself: each backend wraps only its fetch-and-load
+    call in ``snapshot.download_phase()``, so a decoder-origin error here is not
+    misreported as ``ModelDownloadError``.
     """
-    from .supervise import mark_download_phase
-
-    try:
-        await _warm(server.backend)
-    except Exception as exc:
-        mark_download_phase(exc)
-        raise
+    await _warm(server.backend)
 
 
 def _emit_ready(server) -> None:
@@ -359,7 +329,7 @@ def _cmd_serve(args: argparse.Namespace) -> None:
         except SystemExit as exc:
             # ``_run_serve`` already turned the failure into ``stt_server: <msg>``
             # on stderr; repeat it as an event so the supervisor can show it.
-            cause = exc.__cause__ or exc.__context__
+            cause = exc.__cause__
             if cause is not None:
                 code, message = supervise.classify_startup_error(cause)
                 supervise.emit(
@@ -399,6 +369,9 @@ def _run_serve(args: argparse.Namespace, **serve_kwargs) -> None:
                 host=args.host,
                 port=args.port,
                 auth_token=_resolve_auth_token(args.auth_token_file),
+                # The CLI owns the process: a stop during startup/warm-up exits
+                # at once rather than waiting on an uncancellable model load.
+                hard_exit_on_stop=True,
                 **serve_kwargs,
             )
         )
@@ -410,7 +383,9 @@ def _run_serve(args: argparse.Namespace, **serve_kwargs) -> None:
         # (superset of ``ModuleNotFoundError``) also catches a partially-present
         # extra whose import fails on a missing sub-symbol.
         print(f"stt_server: {exc}", file=sys.stderr)
-        raise SystemExit(1)
+        # Explicit ``from exc``: ``_cmd_serve`` classifies the supervised error
+        # event from ``__cause__``.
+        raise SystemExit(1) from exc
 
 
 async def _probe_status(args: argparse.Namespace) -> dict:

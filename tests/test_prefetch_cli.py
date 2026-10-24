@@ -427,3 +427,88 @@ def test_human_check_output(fake_hub, monkeypatch, capsys):
 def test_prefetch_requires_backend(monkeypatch, capsys):
     code, _events, err = _run(monkeypatch, capsys)
     assert code == 2 and "--backend" in err
+
+
+def _fake_hub_with_config(tmp_path, monkeypatch, config: bytes | None, drop: str | None = None):
+    files = dict(_FILES)
+    if config is None:
+        files.pop("config.json")
+    else:
+        files["config.json"] = config
+    if drop:
+        files.pop(drop)
+
+    def fake(spec, *, local_files_only):
+        snap = tmp_path / "hub" / spec.repo_id.replace("/", "--")
+        snap.mkdir(parents=True, exist_ok=True)
+        for name, data in files.items():
+            (snap / name).write_bytes(data)
+        return str(snap)
+
+    monkeypatch.setattr(PF, "_snapshot_download", fake)
+    monkeypatch.setattr(PF, "_remote_files", lambda spec: [])
+    monkeypatch.setattr(PF, "_repo_cache_dir", lambda repo: tmp_path / "cache")
+
+
+@pytest.mark.parametrize(
+    ("backend", "config", "drop"),
+    [
+        ("parakeet", _FILES["config.json"], "model.safetensors"),  # incomplete snapshot
+        ("kyutai", b"{not json", None),  # corrupt config.json
+        ("kyutai", b'{"tokenizer_name": "tokenizer.model"}', None),  # missing mimi_name
+        ("kyutai", b'{"mimi_name": "*.safetensors", "tokenizer_name": "t.model"}', None),
+    ],
+)
+def test_unusable_snapshot_is_model_invalid_not_download_error(
+    tmp_path, monkeypatch, capsys, backend, config, drop
+):
+    """Nothing network-related failed: neither ModelDownloadError nor the
+    generic BackendStartError/ConfigError (prefetch never starts a backend)."""
+    _fake_hub_with_config(tmp_path, monkeypatch, config, drop)
+    code, events, _ = _run(monkeypatch, capsys, "--backend", backend, "--json")
+    assert code == 1
+    assert events[-1]["event"] == "error" and events[-1]["code"] == "ModelInvalidError"
+
+
+@pytest.mark.parametrize("check", [True, False])
+def test_invalid_local_model_is_model_invalid(tmp_path, monkeypatch, capsys, check):
+    model = tmp_path / "incomplete"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    argv = ["--backend", "mlx", "--model", str(model), "--json"]
+    if check:
+        argv.append("--check")
+    code, events, _ = _run(monkeypatch, capsys, *argv)
+    if check:
+        assert code == 0 and events[-1]["cached"] is False
+    else:
+        assert code == 1 and events[-1]["code"] == "ModelInvalidError"
+
+
+@pytest.mark.parametrize(
+    "name", ["*.safetensors", "../evil.safetensors", "sub/model.safetensors", "m[1].bin", "", 7]
+)
+def test_kyutai_config_names_must_be_plain_filenames(name):
+    from stt_server.backends import kyutai as K
+
+    config = {"mimi_name": name, "tokenizer_name": "tokenizer.model"}
+    with pytest.raises(ValueError):
+        K.weight_files(config)
+    config = {"mimi_name": "mimi@1.safetensors", "tokenizer_name": "t.model", "moshi_name": name}
+    with pytest.raises(ValueError):
+        K.weight_files(config)
+
+
+def test_kyutai_glob_config_never_reads_as_cached(tmp_path, monkeypatch, capsys):
+    """A config naming ``*.safetensors`` must not match whatever ``.safetensors``
+    file exists while the literal file the loader requests is absent."""
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    (snap / "config.json").write_text(
+        json.dumps({"mimi_name": "*.safetensors", "tokenizer_name": "tokenizer.model"})
+    )
+    (snap / "model.safetensors").write_bytes(b"m")
+    (snap / "tokenizer.model").write_bytes(b"t")
+    monkeypatch.setattr(PF, "_snapshot_download", lambda spec, *, local_files_only: str(snap))
+    code, events, _ = _run(monkeypatch, capsys, "--backend", "kyutai", "--check", "--json")
+    assert code == 0 and events[-1]["cached"] is False

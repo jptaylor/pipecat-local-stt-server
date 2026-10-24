@@ -30,14 +30,14 @@ from ..protocol import (
     AUDIO_SAMPLE_RATE_HZ,
     AUDIO_SAMPLE_WIDTH_BYTES,
 )
-from ._thread_util import DecodeGuardMixin, run_in_daemon_thread
+from ..snapshot import SnapshotSpec, download_phase
+from . import DEFAULT_PARAKEET_MODEL
+from ._thread_util import DecodeGuardMixin
 
 logger = logging.getLogger("stt_server.backends.parakeet")
 
-# Default model for ``--backend parakeet``. Exported so Phase 2's
-# backend-aware ``--model`` default imports it rather than hardcoding a second
-# copy. ``parakeet-tdt-0.6b-v3`` is the package's own CLI default.
-DEFAULT_PARAKEET_MODEL = "mlx-community/parakeet-tdt-0.6b-v3"
+# Default model for ``--backend parakeet``: defined once in the backend
+# registry (``backends/__init__.py``) and re-exported here.
 
 # Parakeet's native attention window is ~24 s. ``parakeet_mlx``'s decode path
 # implements chunk-and-concatenate (token-merge across overlapping chunks) when
@@ -92,11 +92,10 @@ class _ParakeetStream:
         async with self._decode_lock:
             if self._cancelled:
                 return
-            # Mark in-flight BEFORE spawning the daemon thread so
-            # ``backend.close()`` observes it immediately; the daemon thread
-            # owns the decrement in a finally block.
-            self._backend._mark_inflight_start()
-            self._result = await run_in_daemon_thread(
+            # ``_run_guarded_decode`` marks in-flight BEFORE spawning the
+            # daemon thread so ``backend.close()`` observes it immediately; the
+            # daemon thread owns the decrement in a finally block.
+            self._result = await self._backend._run_guarded_decode(
                 self._decode_sync, thread_name="parakeet-decode"
             )
 
@@ -213,10 +212,17 @@ class ParakeetBackend(DecodeGuardMixin):
             if self._model is None:
                 from parakeet_mlx import from_pretrained  # type: ignore
 
-                self._model = from_pretrained(self._model_id)
+                # Fetch-and-load only (not the decode): a bare network error
+                # here is a model download failure.
+                with download_phase():
+                    self._model = from_pretrained(self._model_id)
             return self._model
 
     async def start(self) -> None:
+        # ``abort()`` (run by the server when an earlier ``start()`` failed)
+        # removes the private temp dir; recreate it so a retried start decodes.
+        if not os.path.isdir(self._tmpdir):
+            self._tmpdir = tempfile.mkdtemp(prefix="pipecat-stt-parakeet-")
         # Eager import; fail fast if the ``parakeet`` extra is not
         # installed. The model itself is NOT loaded here — see ``_get_model``.
         # Re-raise a missing module as an actionable message (a bare
@@ -256,10 +262,8 @@ class ParakeetBackend(DecodeGuardMixin):
         self.abort()
 
 
-def prefetch_specs(model: str | None) -> list:
+def prefetch_specs(model: str | None) -> list[SnapshotSpec]:
     """Snapshots ``python -m stt_server prefetch --backend parakeet`` fetches:
     the two files ``parakeet_mlx.from_pretrained`` downloads."""
-    from ..prefetch import SnapshotSpec
-
     files = ("config.json", "model.safetensors")
     return [SnapshotSpec(model or DEFAULT_PARAKEET_MODEL, allow_patterns=files, required=files)]

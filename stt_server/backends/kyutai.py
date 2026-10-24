@@ -28,15 +28,18 @@ import asyncio
 import json
 import logging
 import threading
+from collections.abc import AsyncGenerator
 from pathlib import Path
-from typing import AsyncGenerator
 
 from ..backend import TranscriptEvent
-from ._thread_util import DecodeGuardMixin, run_in_daemon_thread
+from ..snapshot import SnapshotSpec, check_plain_filenames, download_phase
+from . import DEFAULT_KYUTAI_MODEL
+from ._thread_util import DecodeGuardMixin
 
 logger = logging.getLogger("stt_server.backends.kyutai")
 
-DEFAULT_KYUTAI_MODEL = "kyutai/stt-1b-en_fr-mlx"
+# ``DEFAULT_KYUTAI_MODEL`` is defined once in the backend registry
+# (``backends/__init__.py``) and re-exported here.
 
 # Model frame: 80 ms at Mimi's 24 kHz.
 _MODEL_RATE_HZ = 24_000
@@ -69,7 +72,7 @@ class _KyutaiStream:
         language: str | None,
         decode_lock: asyncio.Lock,
         thread_lock: threading.Lock,
-        backend: "KyutaiBackend",
+        backend: KyutaiBackend,
     ) -> None:
         # ``language`` is accepted for the protocol and ignored: the model
         # transcribes English and French without a language prompt.
@@ -96,8 +99,7 @@ class _KyutaiStream:
         async with self._decode_lock:
             if self._cancelled:
                 return
-            self._backend._mark_inflight_start()
-            self._result = await run_in_daemon_thread(
+            self._result = await self._backend._run_guarded_decode(
                 self._decode_sync, thread_name="kyutai-decode"
             )
 
@@ -147,15 +149,19 @@ class KyutaiBackend(DecodeGuardMixin):
             if self._loaded is not None:
                 return self._loaded
             import mlx.core as mx  # type: ignore
-            import mlx.nn as nn  # type: ignore
             import sentencepiece  # type: ignore
             from huggingface_hub import hf_hub_download  # type: ignore
+            from mlx import nn  # type: ignore
             from moshi_mlx import models, utils  # type: ignore
 
-            raw = json.loads(Path(hf_hub_download(self._model_id, "config.json")).read_text())
-            mimi_weights = hf_hub_download(self._model_id, raw["mimi_name"])
-            lm_weights = hf_hub_download(self._model_id, raw.get("moshi_name", "model.safetensors"))
-            tokenizer = hf_hub_download(self._model_id, raw["tokenizer_name"])
+            with download_phase():
+                raw = json.loads(Path(hf_hub_download(self._model_id, "config.json")).read_text())
+            # The same validated names prefetch fetches (``weight_files``).
+            _config, mimi_name, moshi_name, tokenizer_name = weight_files(raw)
+            with download_phase():
+                mimi_weights = hf_hub_download(self._model_id, mimi_name)
+                lm_weights = hf_hub_download(self._model_id, moshi_name)
+                tokenizer = hf_hub_download(self._model_id, tokenizer_name)
 
             lm = models.Lm(models.LmConfig.from_config_dict(raw))
             lm.set_dtype(mx.bfloat16)
@@ -234,7 +240,7 @@ class KyutaiBackend(DecodeGuardMixin):
                 f"({missing}) — run: uv sync --extra kyutai --inexact"
             ) from exc
 
-    async def open_stream(self, *, language: str | None = None) -> "_KyutaiStream":
+    async def open_stream(self, *, language: str | None = None) -> _KyutaiStream:
         return _KyutaiStream(language, self._decode_lock, self._thread_lock, self)
 
     async def close(self) -> None:
@@ -247,24 +253,29 @@ def weight_files(config: dict) -> tuple[str, ...]:
     Mirrors ``_get_model`` exactly (``moshi_name`` defaults to
     ``model.safetensors`` and may be a ``.q4``/``.q8`` variant), so prefetch and
     the completeness check follow quantized repos instead of assuming one name.
+
+    The names are untrusted remote input used as Hub filenames and as prefetch
+    ``allow_patterns``/``fnmatch`` patterns, so each must be a literal plain
+    filename (``ValueError`` otherwise: no ``/``, ``..`` or glob characters).
     """
     for key in ("mimi_name", "tokenizer_name"):
         if key not in config:
             raise KeyError(f"config.json has no {key!r}")
-    return (
-        "config.json",
-        config["mimi_name"],
-        config.get("moshi_name", "model.safetensors"),
-        config["tokenizer_name"],
+    return check_plain_filenames(
+        (
+            "config.json",
+            config["mimi_name"],
+            config.get("moshi_name", "model.safetensors"),
+            config["tokenizer_name"],
+        ),
+        source="kyutai config.json",
     )
 
 
-def prefetch_specs(model: str | None) -> list:
+def prefetch_specs(model: str | None) -> list[SnapshotSpec]:
     """Snapshots ``python -m stt_server prefetch --backend kyutai`` fetches: the
     config, Mimi and LM weights and the tokenizer that ``_get_model`` loads. The
     weight filenames come from ``config.json`` (see ``weight_files``)."""
-    from ..prefetch import SnapshotSpec
-
     return [
         SnapshotSpec(
             model or DEFAULT_KYUTAI_MODEL,

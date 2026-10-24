@@ -49,14 +49,14 @@ from ..protocol import (
     AUDIO_SAMPLE_RATE_HZ,
     AUDIO_SAMPLE_WIDTH_BYTES,
 )
-from ._thread_util import DecodeGuardMixin, run_in_daemon_thread
+from ..snapshot import SnapshotSpec, download_phase
+from . import DEFAULT_NEMOTRON_MODEL
+from ._thread_util import DecodeGuardMixin
 
 logger = logging.getLogger("stt_server.backends.nemotron")
 
-# Default model for ``--backend nemotron``. Exported so Phase 2's
-# backend-aware ``--model`` default imports it rather than hardcoding a second
-# copy (single source of truth, mirrors ``DEFAULT_PARAKEET_MODEL``).
-DEFAULT_NEMOTRON_MODEL = "mlx-community/nemotron-3.5-asr-streaming-0.6b"
+# Default model for ``--backend nemotron``: defined once in the backend
+# registry (``backends/__init__.py``) and re-exported here.
 
 # Default ``language`` forwarded to ``generate()`` when the client supplies no
 # language. ``"auto"`` is a verified accepted prompt key AND the model's own
@@ -105,11 +105,10 @@ class _NemotronStream:
         async with self._decode_lock:
             if self._cancelled:
                 return
-            # Mark in-flight BEFORE spawning the daemon thread so
-            # ``backend.close()`` observes it immediately; the daemon thread
-            # owns the decrement in a finally block.
-            self._backend._mark_inflight_start()
-            self._result = await run_in_daemon_thread(
+            # ``_run_guarded_decode`` marks in-flight BEFORE spawning the
+            # daemon thread so ``backend.close()`` observes it immediately; the
+            # daemon thread owns the decrement in a finally block.
+            self._result = await self._backend._run_guarded_decode(
                 self._decode_sync, thread_name="nemotron-decode"
             )
 
@@ -226,10 +225,17 @@ class NemotronBackend(DecodeGuardMixin):
             if self._model is None:
                 from mlx_audio.stt import load  # type: ignore
 
-                self._model = load(self._model_id)
+                # Fetch-and-load only (not the decode): a bare network error
+                # here is a model download failure.
+                with download_phase():
+                    self._model = load(self._model_id)
             return self._model
 
     async def start(self) -> None:
+        # ``abort()`` (run by the server when an earlier ``start()`` failed)
+        # removes the private temp dir; recreate it so a retried start decodes.
+        if not os.path.isdir(self._tmpdir):
+            self._tmpdir = tempfile.mkdtemp(prefix="pipecat-stt-nemotron-")
         # Eager import; fail fast before the socket binds if the ``mlx-audio``
         # package is not installed. The model itself is NOT loaded here — see
         # ``_get_model``. Re-raise a missing module as an actionable message —
@@ -289,10 +295,8 @@ _MLX_AUDIO_ALLOW_PATTERNS = (
 )
 
 
-def prefetch_specs(model: str | None) -> list:
+def prefetch_specs(model: str | None) -> list[SnapshotSpec]:
     """Snapshots ``python -m stt_server prefetch --backend nemotron`` fetches."""
-    from ..prefetch import SnapshotSpec
-
     return [
         SnapshotSpec(
             model or DEFAULT_NEMOTRON_MODEL,

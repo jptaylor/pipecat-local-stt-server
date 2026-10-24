@@ -44,36 +44,19 @@ import os
 import sys
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
+
+# ``SnapshotSpec`` lives in the stdlib-only ``stt_server.snapshot`` (the backends
+# import it from there); re-exported here for existing callers.
+from .snapshot import SnapshotSpec, check_plain_filenames, download_phase, mark_model_invalid
+
+__all__ = ["SnapshotSpec", "check_spec", "fetch_spec", "run_prefetch", "specs_for"]
 
 logger = logging.getLogger("stt_server.prefetch")
 
 _PROGRESS_INTERVAL_S = 0.3
-
-
-@dataclass(frozen=True)
-class SnapshotSpec:
-    """One Hugging Face snapshot a backend needs before it can decode offline."""
-
-    repo_id: str
-    revision: str | None = None  # None = the repo's main branch, as the loaders use
-    #: ``None`` downloads the whole repo (what ``mlx_whisper`` does).
-    allow_patterns: tuple[str, ...] | None = None
-    #: Glob patterns that must each match a file for the snapshot to count as
-    #: cached. Checked explicitly because older ``huggingface_hub`` releases
-    #: return a partial snapshot folder from ``local_files_only=True``.
-    required: tuple[str, ...] = ()
-    kind: str = "model"
-    #: Set only for an explicit local model reference. It bypasses Hub calls but
-    #: still uses this backend-owned spec's ``required`` completeness patterns.
-    local_path: str | None = None
-    #: For repos whose weight filenames live in their own ``config.json`` (Kyutai:
-    #: ``moshi_name`` may be a ``.q4``/``.q8`` variant). Called with the parsed
-    #: config, it returns the exact filenames to fetch and require, replacing
-    #: ``allow_patterns``/``required``. ``config.json`` is fetched first.
-    resolve: Callable[[dict], tuple[str, ...]] | None = None
 
 
 def _resolved(spec: SnapshotSpec, path: str | Path) -> SnapshotSpec:
@@ -85,8 +68,26 @@ def _resolved(spec: SnapshotSpec, path: str | Path) -> SnapshotSpec:
     if spec.resolve is None:
         return spec
     config = json.loads((Path(path) / "config.json").read_text())
-    names = tuple(spec.resolve(config))
+    # The names become ``allow_patterns`` and ``fnmatch`` patterns: refuse
+    # anything that is not a literal plain filename.
+    names = check_plain_filenames(tuple(spec.resolve(config)), source=f"{spec.repo_id} config.json")
     return replace(spec, allow_patterns=names, required=names, resolve=None)
+
+
+def _validated(spec: SnapshotSpec, path: str | Path, *, what: str) -> SnapshotSpec:
+    """``_resolved`` + the completeness check, for a fetched or local snapshot.
+
+    Any failure means the snapshot on disk is unusable, so it is tagged
+    ``ModelInvalidError`` (not a download error: nothing was being fetched).
+    """
+    try:
+        spec = _resolved(spec, path)
+        if not _complete(path, spec.required):
+            raise FileNotFoundError(f"{what} is missing {', '.join(spec.required)}")
+    except Exception as exc:
+        mark_model_invalid(exc)
+        raise
+    return spec
 
 
 def is_local_model(model: str) -> bool:
@@ -94,29 +95,27 @@ def is_local_model(model: str) -> bool:
     return model.startswith(("/", "./", "../", "~")) or Path(model).expanduser().exists()
 
 
-_BACKEND_MODULES = {
-    "mlx": "stt_server.backends.mlx_whisper",
-    "parakeet": "stt_server.backends.parakeet",
-    "nemotron": "stt_server.backends.nemotron",
-    "kyutai": "stt_server.backends.kyutai",
-}
+def _entry(backend: str):
+    from .backends import BACKENDS
+
+    try:
+        return BACKENDS[backend]
+    except KeyError:
+        raise ValueError(f"unknown backend: {backend!r}") from None
 
 
 def specs_for(backend: str, model: str | None) -> list[SnapshotSpec]:
     """Every snapshot ``backend`` needs to start ``model`` without the network."""
-    if backend == "echo":
-        return []
-    try:
-        module = _BACKEND_MODULES[backend]
-    except KeyError:
-        raise ValueError(f"unknown backend: {backend!r}") from None
-    return list(importlib.import_module(module).prefetch_specs(model))
+    entry = _entry(backend)
+    if entry.module is None:
+        return []  # echo: no model
+    return list(importlib.import_module(entry.module).prefetch_specs(model))
 
 
 def local_specs_for(backend: str, model: str) -> list[SnapshotSpec]:
     """Attach an explicit local directory to the backend's structural specs."""
-    if backend == "kyutai":
-        raise ValueError("the kyutai backend does not support local model paths")
+    if not _entry(backend).local_model_paths:
+        raise ValueError(f"the {backend} backend does not support local model paths")
     path = Path(model).expanduser()
     return [replace(spec, local_path=str(path)) for spec in specs_for(backend, model)]
 
@@ -238,10 +237,10 @@ def fetch_spec(spec: SnapshotSpec, emit: Callable[[dict], None] | None) -> dict[
     if spec.local_path is not None:
         path = spec.local_path
         if not Path(path).is_dir():
-            raise FileNotFoundError(f"local model directory does not exist: {path}")
-        spec = _resolved(spec, path)
-        if not _complete(path, spec.required):
-            raise FileNotFoundError(f"{path}: local model is missing {', '.join(spec.required)}")
+            exc = FileNotFoundError(f"local model directory does not exist: {path}")
+            mark_model_invalid(exc)
+            raise exc
+        spec = _validated(spec, path, what=f"{path}: local model")
         result = {
             "event": "done",
             "repo": spec.repo_id,
@@ -255,16 +254,24 @@ def fetch_spec(spec: SnapshotSpec, emit: Callable[[dict], None] | None) -> dict[
         # Fetch the (tiny) config first to learn which weight files this repo
         # names, then fetch exactly those.
         config_only = replace(spec, allow_patterns=("config.json",), required=(), resolve=None)
-        spec = _resolved(spec, _snapshot_download(config_only, local_files_only=False))
+        with download_phase():
+            config_path = _snapshot_download(config_only, local_files_only=False)
+        try:
+            spec = _resolved(spec, config_path)
+        except Exception as exc:
+            mark_model_invalid(exc)
+            raise
     reporter: threading.Thread | None = None
     done = threading.Event()
     if emit is not None:
         blobs = _repo_cache_dir(spec.repo_id) / "blobs"
         # Only files not yet in the cache count: a finished blob is named by its
         # id, a partial one ``<id>.incomplete``.
+        with download_phase():
+            remote = _remote_files(spec)
         pending = [
             (int(f[1]), f[2] if len(f) > 2 else None)
-            for f in _remote_files(spec)
+            for f in remote
             if not ((f[2] if len(f) > 2 else None) and (blobs / f[2]).is_file())
         ]
         total = sum(size for size, _ in pending)
@@ -300,13 +307,13 @@ def fetch_spec(spec: SnapshotSpec, emit: Callable[[dict], None] | None) -> dict[
         reporter = threading.Thread(target=report, name="prefetch-progress", daemon=True)
         reporter.start()
     try:
-        path = _snapshot_download(spec, local_files_only=False)
+        with download_phase():
+            path = _snapshot_download(spec, local_files_only=False)
     finally:
         done.set()
         if reporter is not None:
             reporter.join(timeout=1)
-    if not _complete(path, spec.required):
-        raise FileNotFoundError(f"{spec.repo_id}: snapshot is missing {', '.join(spec.required)}")
+    _validated(spec, path, what=f"{spec.repo_id}: snapshot")
     if emit is not None:
         emit(progress(total, files_total))  # the download finished: report 100%
     result = {
@@ -389,10 +396,9 @@ def _run_fetch(backend: str, model: str | None, specs: list[SnapshotSpec], emit)
         except ImportError:
             raise
         except Exception as exc:
+            # Origin tags (download vs unusable snapshot) are set where the
+            # failure happened inside ``fetch_spec``; only attach the repo here.
             exc._prefetch_repo = spec.repo_id  # type: ignore[attr-defined]
-            from . import supervise
-
-            supervise.mark_download_phase(exc)  # a fetch failure is a download failure
             raise
     if emit is not None:
         emit(

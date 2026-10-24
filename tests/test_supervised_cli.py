@@ -118,6 +118,7 @@ def test_supervised_stop_during_blocked_warmup_exits_without_ready(stop_kind):
                 port=0,
                 ready=blocked_ready,
                 stop_on_stdin_eof=True,
+                hard_exit_on_stop=True,
             )
         )
         """
@@ -182,6 +183,7 @@ def test_stop_during_blocked_warmup_removes_socket_and_tmpdir(short_home, backen
                 socket_path={str(sock)!r},
                 ready=blocked_ready,
                 stop_on_stdin_eof=True,
+                hard_exit_on_stop=True,
             )
         )
         """
@@ -567,16 +569,60 @@ def test_supervised_preflight_oserror_is_not_reported_as_download_error(
     assert "download" not in event["message"]
 
 
-def test_warmup_connection_error_is_reported_as_download_error():
+def test_warmup_decoder_connection_error_is_not_a_download_error():
+    """Warm-up runs a decode as well as the lazy load; a builtin network error
+    from the decoder (not a fetch) must not be reported as a model download."""
     import asyncio
 
     class FailingBackend:
         async def open_stream(self, *, language=None):
-            raise ConnectionResetError("model host hung up")
+            raise ConnectionResetError("decoder socket hung up")
 
     server = SimpleNamespace(backend=FailingBackend())
     with pytest.raises(ConnectionResetError) as exc:
         asyncio.run(cli._prepare_ready(server))
+    assert supervise.classify_startup_error(exc.value)[0] == "BackendStartError"
+
+
+def _fake_modules(monkeypatch, **modules):
+    for name, attrs in modules.items():
+        monkeypatch.setitem(sys.modules, name, SimpleNamespace(**attrs))
+
+
+def _reset(*_a, **_k):
+    raise ConnectionResetError("model host hung up")
+
+
+@pytest.mark.parametrize("backend_name", ["parakeet", "nemotron", "kyutai"])
+def test_backend_model_fetch_connection_error_is_download_error(monkeypatch, backend_name):
+    """Only the backend's fetch-and-load call is tagged as the download phase."""
+    if backend_name == "parakeet":
+        from stt_server.backends.parakeet import ParakeetBackend as cls
+
+        _fake_modules(monkeypatch, parakeet_mlx={"from_pretrained": _reset})
+    elif backend_name == "nemotron":
+        from stt_server.backends.nemotron import NemotronBackend as cls
+
+        _fake_modules(monkeypatch, mlx_audio={}, **{"mlx_audio.stt": {"load": _reset}})
+    else:
+        from stt_server.backends.kyutai import KyutaiBackend as cls
+
+        core, nn = SimpleNamespace(), SimpleNamespace()
+        _fake_modules(
+            monkeypatch,
+            mlx={"core": core, "nn": nn},
+            sentencepiece={},
+            moshi_mlx={"models": None, "utils": None},
+            huggingface_hub={"hf_hub_download": _reset},
+        )
+        monkeypatch.setitem(sys.modules, "mlx.core", core)
+        monkeypatch.setitem(sys.modules, "mlx.nn", nn)
+    backend = cls(model="x/y")
+    try:
+        with pytest.raises(ConnectionResetError) as exc:
+            backend._get_model()
+    finally:
+        getattr(backend, "abort", lambda: None)()
     assert supervise.classify_startup_error(exc.value)[0] == "ModelDownloadError"
 
 
@@ -625,3 +671,125 @@ def test_json_channel_routes_prints_to_stderr(capsys):
     out, err = capsys.readouterr()
     assert out == '{"event":"x","n":1}\n'
     assert "library noise" in err
+
+
+@pytest.mark.parametrize("hard", [True, False])
+def test_stop_during_warmup_hard_exit_is_opt_in(hard):
+    """``hard_exit_on_stop=True`` (the CLI): abort_sync + os._exit, no shutdown.
+    Default (embedders): the warm-up is cancelled, shutdown()/close() run and
+    ``serve`` returns to its caller."""
+    script = textwrap.dedent(
+        """
+        import asyncio
+        import os
+        import sys
+
+        from stt_server.backend import EchoBackend
+        from stt_server.server import serve
+
+        class B(EchoBackend):
+            def abort(self):
+                os.write(2, b"abort\\n")
+
+            async def close(self):
+                os.write(2, b"close\\n")
+
+        async def blocked_ready(server):
+            os.write(2, b"warmup-blocked\\n")
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                os.write(2, b"warmup-cancelled\\n")
+                raise
+
+        asyncio.run(
+            serve(
+                B(),
+                host="127.0.0.1",
+                port=0,
+                ready=blocked_ready,
+                hard_exit_on_stop=sys.argv[1] == "1",
+            )
+        )
+        os.write(2, b"returned\\n")
+        """
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script, "1" if hard else "0"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_env(),
+    )
+    try:
+        assert proc.stderr is not None
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([proc.stderr], [], [], 0.25)
+            if ready and proc.stderr.readline() == b"warmup-blocked\n":
+                break
+        else:
+            raise AssertionError("warm-up did not block in time")
+        proc.terminate()
+        assert proc.wait(timeout=5) == 0
+        lines = set(proc.stderr.read().decode().split())
+    finally:
+        _finish(proc)
+    if hard:
+        assert "abort" in lines and "close" not in lines and "returned" not in lines
+    else:
+        assert {"warmup-cancelled", "close", "returned"} <= lines and "abort" not in lines
+
+
+def test_cli_run_serve_opts_into_hard_exit(monkeypatch):
+    seen = {}
+
+    async def fake_serve(backend, **kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(cli, "serve", fake_serve)
+    args = SimpleNamespace(
+        backend="echo", model=None, socket_path=None, host="127.0.0.1", port=0, auth_token_file=None
+    )
+    cli._run_serve(args)
+    assert seen["hard_exit_on_stop"] is True
+
+
+def test_run_serve_failure_chains_the_cause_explicitly(monkeypatch, capsys):
+    """``_cmd_serve`` classifies the supervised error event from ``__cause__``."""
+    original = OSError(errno.EADDRINUSE, "Address already in use")
+
+    async def failing_serve(backend, **kwargs):
+        raise original
+
+    monkeypatch.setattr(cli, "serve", failing_serve)
+    args = SimpleNamespace(
+        backend="echo", model=None, socket_path=None, host="127.0.0.1", port=0, auth_token_file=None
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli._run_serve(args)
+    assert exc.value.code == 1 and exc.value.__cause__ is original
+
+
+@pytest.mark.parametrize("backend_name", ["parakeet", "nemotron"])
+def test_start_after_abort_recreates_private_tmpdir(monkeypatch, backend_name):
+    """A failed start runs ``abort()`` (removing the temp dir); a retried
+    ``start()`` on the same backend must still have somewhere to write WAVs."""
+    import asyncio
+
+    if backend_name == "parakeet":
+        from stt_server.backends.parakeet import ParakeetBackend as cls
+
+        _fake_modules(monkeypatch, parakeet_mlx={})
+    else:
+        from stt_server.backends.nemotron import NemotronBackend as cls
+
+        _fake_modules(monkeypatch, mlx_audio={}, **{"mlx_audio.stt": {"load": _reset}})
+    backend = cls(model="x/y")
+    try:
+        backend.abort()
+        assert not os.path.isdir(backend._tmpdir)
+        asyncio.run(backend.start())
+        assert os.path.isdir(backend._tmpdir)
+        assert (os.stat(backend._tmpdir).st_mode & 0o777) == 0o700
+    finally:
+        backend.abort()
