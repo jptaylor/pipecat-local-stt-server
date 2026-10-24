@@ -365,3 +365,226 @@ async def test_shutdown_is_bounded_when_a_task_swallows_cancellation(monkeypatch
         released = True
         task.cancel()
         await asyncio.wait({task}, timeout=1)
+
+
+# --- start()/shutdown() lifecycle contract ------------------------------------
+#
+# Invariant: once ``shutdown()`` is entered, no ``start()`` (in flight or later)
+# binds a listener or marks the server started, and the single-server lock is
+# held until nothing of this server can still touch the socket: an in-flight
+# start releases it when it unwinds, stuck session tasks when the last finishes.
+
+
+async def test_shutdown_during_backend_start_never_binds(short_home):
+    import asyncio
+
+    sock = short_home / "s" / "stt.sock"
+    entered, gate = asyncio.Event(), asyncio.Event()
+
+    class SlowStart(_AbortCounting):
+        async def start(self):
+            entered.set()
+            await gate.wait()
+
+    backend = SlowStart()
+    srv = TranscriptionServer(backend, ServerConfig(socket_path=str(sock)))
+    task = asyncio.ensure_future(srv.start())
+    await entered.wait()
+    await srv.shutdown()
+    # The start still owns the lock: releasing it here would let a new server
+    # take the path while this start could still bind it.
+    assert socket_lock_held(sock) is True
+    gate.set()
+    with pytest.raises(RuntimeError):
+        await task
+    assert srv._started is False and srv.sockets_bound == []
+    assert not sock.exists()
+    assert socket_lock_held(sock) is False
+    assert backend.aborts == 1
+    with pytest.raises(RuntimeError):
+        await srv.start()  # a shut-down server never starts again
+
+
+async def test_shutdown_during_bind_closes_the_bound_listener(short_home, monkeypatch):
+    import asyncio
+
+    from stt_server import server as S
+
+    sock = short_home / "s" / "stt.sock"
+    srv = TranscriptionServer(EchoBackend(), ServerConfig(socket_path=str(sock)))
+    real_bind = S.ws_unix_serve
+
+    async def bind_then_shutdown(*a, **k):
+        listener = await real_bind(*a, **k)
+        await srv.shutdown()  # lands between the bind and ``_started = True``
+        return listener
+
+    monkeypatch.setattr(S, "ws_unix_serve", bind_then_shutdown)
+    with pytest.raises(RuntimeError):
+        await srv.start()
+    assert srv._started is False and srv.sockets_bound == []
+    assert not sock.exists()
+    assert socket_lock_held(sock) is False
+    await asyncio.sleep(0)
+
+
+async def test_cancel_during_bind_does_not_leak_the_listener(short_home, monkeypatch):
+    import asyncio
+
+    from stt_server import server as S
+
+    sock = short_home / "s" / "stt.sock"
+    srv = TranscriptionServer(EchoBackend(), ServerConfig(socket_path=str(sock)))
+    real_bind = S.ws_unix_serve
+    bound = asyncio.Event()
+    listeners = []
+
+    async def slow_tail_bind(*a, **k):
+        listener = await real_bind(*a, **k)
+        listeners.append(listener)
+        bound.set()
+        await asyncio.sleep(0.05)  # the await after the synchronous bind
+        return listener
+
+    monkeypatch.setattr(S, "ws_unix_serve", slow_tail_bind)
+    task = asyncio.ensure_future(srv.start())
+    await bound.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    (listener,) = listeners
+    assert not listener.is_serving()
+    assert not sock.exists()
+    assert socket_lock_held(sock) is False
+
+
+async def test_serve_soft_stop_with_a_stubborn_start_never_binds(short_home, monkeypatch):
+    """``serve(hard_exit_on_stop=False)``: a start that swallows the cancel
+    outlives serve's bounded wait; it must not bind once serve has returned."""
+    import asyncio
+    import functools
+    import signal
+
+    from stt_server import server as S
+
+    monkeypatch.setattr(
+        S, "ServerConfig", functools.partial(S.ServerConfig, drain_timeout_seconds=0.1)
+    )
+    sock = short_home / "s" / "stt.sock"
+    entered, gate = asyncio.Event(), asyncio.Event()
+
+    class Stubborn(EchoBackend):
+        async def start(self):
+            entered.set()
+            while not gate.is_set():
+                try:
+                    await gate.wait()
+                except asyncio.CancelledError:
+                    pass  # swallows the stop's cancel
+
+    serving = asyncio.ensure_future(S.serve(Stubborn(), socket_path=str(sock)))
+    try:
+        await entered.wait()
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.wait_for(serving, timeout=5)
+        assert socket_lock_held(sock) is True  # the stuck start still owns it
+        gate.set()
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if not socket_lock_held(sock):
+                break
+        assert socket_lock_held(sock) is False
+        assert not sock.exists()
+    finally:
+        gate.set()
+        asyncio.get_running_loop().remove_signal_handler(signal.SIGTERM)
+
+
+async def test_stuck_session_task_keeps_lock_until_it_finishes(short_home, monkeypatch):
+    """Embedding mode: ``shutdown()`` returns on its bound, but a task that
+    swallowed cancellation keeps the lock held until it actually finishes."""
+    import asyncio
+
+    from stt_server import server as S
+
+    monkeypatch.setattr(S, "_CANCEL_GRACE_SECONDS", 0.1)
+    sock = short_home / "s" / "stt.sock"
+    cfg = ServerConfig(socket_path=str(sock), drain_timeout_seconds=0.1)
+    srv = TranscriptionServer(EchoBackend(), cfg)
+    await srv.start()
+    release = asyncio.Event()
+
+    async def stubborn():
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                pass
+
+    task = asyncio.ensure_future(stubborn())
+    srv._active_handlers.add(task)
+    try:
+        await asyncio.wait_for(srv.shutdown(), timeout=3)
+        assert srv.stuck_task_count == 1
+        assert socket_lock_held(sock) is True
+    finally:
+        release.set()
+        await asyncio.wait({task}, timeout=1)
+    await asyncio.sleep(0)
+    assert srv.stuck_task_count == 0
+    assert socket_lock_held(sock) is False
+
+
+def test_cli_exits_when_a_session_task_outlives_shutdown():
+    """``hard_exit_on_stop=True``: ``asyncio.run`` teardown re-gathers leftover
+    tasks with no timeout, so a stuck session task would wedge the process
+    after SIGTERM. serve exits the process instead."""
+    import subprocess
+    import sys
+    import textwrap
+    import time
+
+    script = textwrap.dedent(
+        """
+        import asyncio, functools, os
+        from stt_server import server as S
+        from stt_server.backend import EchoBackend
+
+        S._CANCEL_GRACE_SECONDS = 0.1
+        S.ServerConfig = functools.partial(S.ServerConfig, drain_timeout_seconds=0.1)
+
+        async def stubborn():
+            while True:
+                try:
+                    await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    pass
+
+        async def ready(server):
+            server._active_handlers.add(asyncio.ensure_future(stubborn()))
+
+        def publish(server):
+            os.write(1, b"ready\\n")
+
+        asyncio.run(S.serve(EchoBackend(), host="127.0.0.1", port=0, ready=ready,
+                            publish_ready=publish, hard_exit_on_stop=True))
+        """
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    try:
+        import select
+
+        assert proc.stdout is not None
+        readable, _, _ = select.select([proc.stdout], [], [], 10)
+        assert readable and proc.stdout.readline() == b"ready\n"
+        start = time.monotonic()
+        proc.terminate()
+        assert proc.wait(timeout=10) == 0
+        assert time.monotonic() - start < 10
+        assert b"outlived shutdown" in proc.stderr.read()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()

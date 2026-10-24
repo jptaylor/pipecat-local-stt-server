@@ -31,15 +31,20 @@ import stat as _stat
 import sys
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 import websockets
 from websockets.asyncio.server import (
     Server,
     ServerConnection,
+)
+from websockets.asyncio.server import (
     serve as ws_serve,
+)
+from websockets.asyncio.server import (
     unix_serve as ws_unix_serve,
 )
 
@@ -349,21 +354,93 @@ class TranscriptionServer:
         # right after bind so ``abort_sync`` only ever unlinks our own inode.
         self._bound_socket_id: tuple[int, int] | None = None
         self._socket_lock_fd: int | None = None
+        # Lifecycle contract between ``start()`` and ``shutdown()``:
+        # ``_closing`` is set (for good) the moment ``shutdown()`` is entered;
+        # a ``start()`` still in flight then never binds a listener or sets
+        # ``_started`` -- it fails at its next checkpoint, closing anything it
+        # bound and releasing the lock itself (``_starting`` tells
+        # ``shutdown()`` the lock is still that start's to release).
+        self._closing = False
+        self._starting = False
+        # Session tasks that did not unwind within the cancel grace of the last
+        # ``shutdown()`` (see ``stuck_task_count``).
+        self._stuck_tasks: set[asyncio.Task] = set()
 
     # --- lifecycle ---
     async def start(self) -> None:
         if self._started:
             return
+        if self._closing:
+            raise RuntimeError("stt_server: start() after shutdown()")
+        self._starting = True
         try:
             await self._start_unlocked()
         except BaseException:
-            # A server that never started is never ``close()``d, so release the
-            # lock and run the backend's cheap ``abort()`` hook here (parakeet /
-            # nemotron would otherwise leak their private temp dir on every
-            # failed start, e.g. a launchd crash-loop against a held lock).
+            # A server that never started is never ``close()``d, so close any
+            # listener this start bound, release the lock and run the backend's
+            # cheap ``abort()`` hook here (parakeet / nemotron would otherwise
+            # leak their private temp dir on every failed start, e.g. a launchd
+            # crash-loop against a held lock).
+            self._close_unstarted_listener()
             self._release_socket_lock()
             abort_backend(self._backend, logger)
             raise
+        finally:
+            self._starting = False
+
+    def _check_not_closing(self) -> None:
+        if self._closing:
+            raise RuntimeError("stt_server: shutdown() was called during startup")
+
+    async def _bind(self, coro: Awaitable[Server]) -> Server:
+        """Await a listener bind; never leak the listener if cancelled mid-bind.
+
+        The bind itself is synchronous inside ``create_server`` but is followed
+        by an await, so a cancellation landing there would drop a bound,
+        serving listener. Shield it; on cancel, record the finished listener in
+        ``_server`` (``start()``'s failure path closes it) and re-raise.
+        """
+        task = asyncio.ensure_future(coro)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await asyncio.wait({task})
+            if not task.cancelled() and task.exception() is None:
+                self._server = task.result()
+                self._record_bound_socket()
+            raise
+
+    def _record_bound_socket(self) -> None:
+        """Record the (st_dev, st_ino) of the Unix socket this process bound.
+
+        Called right after bind, while this start holds the single-server lock,
+        so the inode at the path is ours."""
+        if not self._config.socket_path:
+            return
+        try:
+            st = os.stat(self._config.socket_path)
+            if _stat.S_ISSOCK(st.st_mode):
+                self._bound_socket_id = (st.st_dev, st.st_ino)
+        except OSError:
+            pass
+
+    def _unlink_own_socket(self) -> None:
+        """Remove the Unix socket file only if it is still the inode we bound."""
+        bound = self._bound_socket_id
+        if bound is not None and self._config.socket_path:
+            path = str(self._config.socket_path)
+            try:
+                st = os.lstat(path)
+                if _stat.S_ISSOCK(st.st_mode) and (st.st_dev, st.st_ino) == bound:
+                    os.unlink(path)
+            except OSError:
+                pass
+
+    def _close_unstarted_listener(self) -> None:
+        server, self._server = self._server, None
+        if server is not None:
+            server.close()
+            self._unlink_own_socket()
 
     async def _start_unlocked(self) -> None:
         verified_socket: Path | None = None
@@ -397,38 +474,43 @@ class TranscriptionServer:
 
     async def _start_locked(self, verified_socket: Path | None) -> None:
         await self._backend.start()
+        # Checkpoint: a ``shutdown()`` that ran while the backend started must
+        # not be followed by a bind (nobody would ever close that listener).
+        self._check_not_closing()
         if verified_socket is not None:
             # Restrict the socket file to owner-only before bind so the UDS
             # trust boundary actually holds on multi-user hosts.
             prior_umask = os.umask(0o077)
             try:
-                self._server = await ws_unix_serve(
-                    self._handle_connection,
-                    path=str(verified_socket),
-                    max_size=self._config.max_append_bytes,
-                    process_request=self._process_request,
+                self._server = await self._bind(
+                    ws_unix_serve(
+                        self._handle_connection,
+                        path=str(verified_socket),
+                        max_size=self._config.max_append_bytes,
+                        process_request=self._process_request,
+                    )
                 )
             finally:
                 os.umask(prior_umask)
-            try:
-                st = os.stat(verified_socket)
-                if _stat.S_ISSOCK(st.st_mode):
-                    self._bound_socket_id = (st.st_dev, st.st_ino)
-            except OSError:
-                pass
+            self._record_bound_socket()
             if self._config.unix_socket_mode is not None:
                 try:
                     os.chmod(verified_socket, self._config.unix_socket_mode)
                 except OSError as exc:
                     logger.warning("stt_server: chmod on UDS failed: %s", exc)
         else:
-            self._server = await ws_serve(
-                self._handle_connection,
-                host=self._config.host,
-                port=self._config.port,
-                max_size=self._config.max_append_bytes,
-                process_request=self._process_request,
+            self._server = await self._bind(
+                ws_serve(
+                    self._handle_connection,
+                    host=self._config.host,
+                    port=self._config.port,
+                    max_size=self._config.max_append_bytes,
+                    process_request=self._process_request,
+                )
             )
+        # Checkpoint: ``shutdown()`` ran during the bind. ``start()``'s failure
+        # path closes the listener we just bound and unlinks our socket inode.
+        self._check_not_closing()
         self._started = True
         logger.info(
             "stt_server listening on %s",
@@ -494,16 +576,14 @@ class TranscriptionServer:
         it here would let a new server acquire it and start loading while this
         process (and its model-load thread) still exists.
         """
-        bound = self._bound_socket_id
-        if bound is not None and self._config.socket_path:
-            path = str(self._config.socket_path)
-            try:
-                st = os.lstat(path)
-                if _stat.S_ISSOCK(st.st_mode) and (st.st_dev, st.st_ino) == bound:
-                    os.unlink(path)
-            except OSError:
-                pass
+        self._unlink_own_socket()
         abort_backend(self._backend, logger)
+
+    @property
+    def stuck_task_count(self) -> int:
+        """Session tasks from the last ``shutdown()`` still alive after its
+        cancel grace (they swallowed or outlived cancellation)."""
+        return sum(1 for t in self._stuck_tasks if not t.done())
 
     async def shutdown(self) -> None:
         """Stop accepting new connections and drain active sessions.
@@ -511,9 +591,24 @@ class TranscriptionServer:
         Drains both connection handlers and their spawned decode tasks under
         a single bounded timeout. Force-cancels anything still running so the
         process never wedges on MLX/Metal teardown.
+
+        Contract:
+
+        - Once entered, no ``start()`` in flight (or later) binds a listener or
+          marks the server started; an in-flight start releases the
+          single-server lock itself when it unwinds.
+        - Returns within the drain timeout plus the cancel grace even when a
+          session task swallows cancellation. Such a task is left running
+          (``stuck_task_count``) and the single-server lock stays held until
+          the last of them finishes, so no new server can take over the socket
+          while this one's sessions still run. The CLI (``serve`` with
+          ``hard_exit_on_stop=True``) then exits the process; an embedding
+          caller owns them (``asyncio.run`` teardown would wait on them).
         """
+        self._closing = True
         if not self._started:
-            self._release_socket_lock()
+            if not self._starting:
+                self._release_socket_lock()
             return
         # launchd sends SIGTERM once, but defensive double-shutdown is cheap:
         # if a second caller races in while the first is still draining, let
@@ -529,10 +624,33 @@ class TranscriptionServer:
             await self._drain_and_close()
         finally:
             # Even when the drain or ``backend.close()`` raises (or this task is
-            # cancelled), release the single-server lock and mark the server
-            # stopped: a concurrent second ``shutdown()`` spins on ``_started``.
-            self._release_socket_lock()
+            # cancelled), release the single-server lock (deferred while a stuck
+            # session task lives) and mark the server stopped: a concurrent
+            # second ``shutdown()`` spins on ``_started``.
+            stuck = {t for t in self._stuck_tasks if not t.done()}
+            if stuck:
+                self._release_socket_lock_after(stuck)
+            else:
+                self._release_socket_lock()
             self._started = False
+
+    def _release_socket_lock_after(self, tasks: set[asyncio.Task]) -> None:
+        """Hand the lock fd to ``tasks``: closed when the last one finishes."""
+        fd, self._socket_lock_fd = self._socket_lock_fd, None
+        if fd is None:
+            return
+        remaining = set(tasks)
+
+        def _done(task: asyncio.Task) -> None:
+            remaining.discard(task)
+            if not remaining:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+        for t in tasks:
+            t.add_done_callback(_done)
 
     async def _drain_and_close(self) -> None:
         if self._server is not None:
@@ -557,6 +675,7 @@ class TranscriptionServer:
                 # Give the cancellations a short, bounded window to unwind
                 # before backend.close() touches shared MLX/Metal state.
                 _done, stuck = await asyncio.wait(still, timeout=_CANCEL_GRACE_SECONDS)
+                self._stuck_tasks = set(stuck)
                 if stuck:
                     logger.warning(
                         "stt_server: %d tasks did not unwind within %.1fs of cancel; "
@@ -1076,7 +1195,7 @@ class TranscriptionServer:
                         asyncio.shield(state.in_flight_task),
                         timeout=self._config.drain_timeout_seconds,
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # Force-cancel and wait for unwind so the decode can't
                     # outlive the session.
                     state.in_flight_task.cancel()
@@ -1267,13 +1386,23 @@ async def serve(
     preparation is pending:
 
     - ``hard_exit_on_stop=False`` (default, for in-process callers): the pending
-      step is cancelled and ``serve`` returns after the normal ``shutdown()``.
-      A model load already running in a worker thread keeps running until it
-      finishes (threads cannot be cancelled); the process is the caller's.
+      step is cancelled and awaited for at most the drain timeout
+      (``ServerConfig.drain_timeout_seconds``), then ``serve`` returns after the
+      normal ``shutdown()``. A step that outlives that bound can no longer bind
+      a listener or mark the server started (see ``shutdown()``); a model load
+      already running in a worker thread keeps running until it finishes
+      (threads cannot be cancelled). Such leftovers are the caller's.
     - ``hard_exit_on_stop=True`` (the CLI, which owns its process): best-effort
       cleanup (``abort_sync``) and an immediate ``os._exit(0)``, so SIGTERM
       during a multi-GB load is honoured at once. Hugging Face downloads resume
       from their ``.incomplete`` blobs next time.
+
+    After a normal ``shutdown()``, session tasks that swallowed cancellation
+    (``stuck_task_count``) would make ``asyncio.run``'s teardown wait on them
+    without a bound. With ``hard_exit_on_stop=True`` the process exits there
+    (``os._exit``: 0 after a requested stop, 1 if ``serve`` was failing); with
+    ``False`` they are the caller's, and the single-server lock stays held
+    until they finish.
     """
     try:
         cfg = ServerConfig(socket_path=socket_path, host=host, port=port, auth_token=auth_token)
@@ -1324,6 +1453,7 @@ async def serve(
         from .supervise import watch_stdin_eof
 
         watch_stdin_eof(loop, _request_stop)
+    failed = False
     try:
         # Race startup against stop in every mode: the signal handlers above are
         # installed before ``start()``, so awaiting it bare would defer a
@@ -1336,5 +1466,20 @@ async def serve(
         if publish_ready is not None:
             publish_ready(server)
         await stop
+    except BaseException:
+        failed = True
+        raise
     finally:
-        await server.shutdown()
+        try:
+            await server.shutdown()
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            if hard_exit_on_stop and server.stuck_task_count:
+                logger.warning(
+                    "stt_server: %d session tasks outlived shutdown; exiting",
+                    server.stuck_task_count,
+                )
+                logging.shutdown()
+                os._exit(1 if failed else 0)
