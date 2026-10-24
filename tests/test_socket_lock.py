@@ -317,15 +317,19 @@ async def test_failed_backend_close_still_releases_lock(short_home):
     await srv.shutdown()  # a second call returns instead of spinning
 
 
-async def test_cancelled_shutdown_still_releases_lock(short_home):
+async def test_cancelled_shutdown_keeps_the_lock_until_close_finishes(short_home):
+    """Cancelling ``shutdown()`` during ``backend.close()`` never abandons the
+    close: the lock is released once it has really finished."""
     import asyncio
 
     sock = short_home / "s" / "stt.sock"
     gate = asyncio.Event()
+    closed = []
 
     class SlowClose(EchoBackend):
         async def close(self):
             await gate.wait()
+            closed.append(True)
 
     srv = TranscriptionServer(SlowClose(), ServerConfig(socket_path=str(sock)))
     await srv.start()
@@ -333,6 +337,10 @@ async def test_cancelled_shutdown_still_releases_lock(short_home):
     await asyncio.sleep(0.05)
     task.cancel()
     await asyncio.wait({task})
+    assert socket_lock_held(sock) is True and srv.state == "stopping"
+    gate.set()
+    await asyncio.wait_for(srv._stopped.wait(), 5)
+    assert closed == [True]
     assert socket_lock_held(sock) is False and srv.state == "stopped"
 
 
