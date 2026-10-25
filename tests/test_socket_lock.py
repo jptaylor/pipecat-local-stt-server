@@ -533,13 +533,13 @@ async def test_stuck_session_task_keeps_lock_until_it_finishes(short_home, monke
     srv._track(task, "session")
     try:
         await asyncio.wait_for(srv.shutdown(), timeout=3)
-        assert srv.stuck_work_count == 1
+        assert srv._stuck_work_count == 1
         assert socket_lock_held(sock) is True
     finally:
         release.set()
         await asyncio.wait({task}, timeout=1)
     await asyncio.sleep(0)
-    assert srv.stuck_work_count == 0
+    assert srv._stuck_work_count == 0
     assert socket_lock_held(sock) is False
 
 

@@ -387,7 +387,7 @@ async def test_cancel_during_drain_keeps_the_lock_while_sessions_run(sock):
         with pytest.raises(asyncio.CancelledError):
             await stopping
         assert task.cancelling(), "an abandoned drain must cancel the sessions it left"
-        assert not task.done() and srv.stuck_work_count == 1
+        assert not task.done() and srv._stuck_work_count == 1
         assert srv.state == "stopping" and _lock_view(srv, sock)
         release.set()
         # The drain was never abandoned: it finishes (closing the backend) and
@@ -423,13 +423,13 @@ async def test_hung_backend_close_is_bounded_and_keeps_the_lock(sock):
     await srv.start()
     await asyncio.wait_for(srv.shutdown(), T)  # returns at the close bound
     assert b.closes == 1 and b.closed == 0
-    assert srv.stuck_work_count == 1  # the close: serve's hard exit sees it
+    assert srv._stuck_work_count == 1  # the close: serve's hard exit sees it
     assert srv.state == "stopping" and _lock_view(srv, sock)
     await asyncio.wait_for(srv.shutdown(), T)  # a later caller: same drain
     assert b.closes == 1
     b.release.set()
     await asyncio.wait_for(srv.wait_stopped(), T)
-    assert b.closed == 1 and srv.stuck_work_count == 0
+    assert b.closed == 1 and srv._stuck_work_count == 0
     assert srv.state == "stopped" and not _lock_view(srv, sock)
 
 
@@ -499,7 +499,7 @@ async def test_second_cancel_during_bind_never_orphans_the_listener(sock, monkey
     # it outlived its start, so it is stuck (one ledger: the CLI's hard exit
     # sees what holds the lock).
     assert srv.state == "stopping" and _lock_view(srv, sock)
-    assert srv.stuck_work_count == 1
+    assert srv._stuck_work_count == 1
     # Security minor: ``Server.close()`` only schedules the listening
     # socket's close; the lock must not be released before it really closed.
     serving_at_release = []
@@ -514,7 +514,7 @@ async def test_second_cancel_during_bind_never_orphans_the_listener(sock, monkey
     gate.set()
     await asyncio.wait_for(srv.wait_stopped(), T)
     assert serving_at_release == [False], "lock released while the orphan listener served"
-    assert srv.stuck_work_count == 0
+    assert srv._stuck_work_count == 0
     (listener,) = listeners
     assert not listener.is_serving()
     assert not sock.exists()
@@ -620,8 +620,8 @@ async def test_a_failing_orphan_cleanup_keeps_the_lock(sock, monkeypatch, caplog
         await asyncio.wait_for(cleaned.wait(), T)
         assert listener.is_serving()  # the work the lock protects is still there
         assert srv.state == "stopping" and _lock_view(srv, sock)
-        assert srv.live_work_count >= 1 and srv.stuck_work_count >= 1
-        assert "1 listener bind" in srv._live_reasons()
+        assert srv.live_work_count >= 1 and srv._stuck_work_count >= 1
+        assert "1 listener bind (1 stuck)" in srv._live_reasons()
         assert await _not_stopped_within(srv, 0.05)
         assert "cleanup of a finished listener bind failed" in caplog.text
     finally:
@@ -655,7 +655,7 @@ async def test_a_then_for_a_done_future_runs_now_and_fails_closed(sock, caplog):
         await asyncio.wait_for(srv.shutdown(), T)
         # The entry whose cleanup failed holds the lock past the drain.
         assert srv.state == "stopping" and _lock_view(srv, sock)
-        assert srv._live_reasons() == ["1 listener bind"] and srv.live_work_count == 1
+        assert srv._live_reasons() == ["1 listener bind (1 stuck)"] and srv.live_work_count == 1
         assert "cleanup of a finished listener bind failed" in caplog.text
     finally:
         srv._live_work.clear()
@@ -759,7 +759,7 @@ async def test_failed_start_drains_the_sessions_it_accepted(sock, monkeypatch, t
         (t,) = sessions
         assert t.cancelling() or t.cancelled(), "the unwind must cancel the session"
         if session == "stubborn":
-            assert not t.done() and srv.stuck_work_count == 1
+            assert not t.done() and srv._stuck_work_count == 1
             assert srv.state == "stopping" and _lock_view(srv, sock)
             # Single-use, and the error names the real cause.
             cause = "after shutdown" if trigger == "shutdown" else "failed start"
@@ -852,7 +852,7 @@ async def test_soft_stop_keeps_an_uncancellable_readiness_step(sock, monkeypatch
         os.kill(os.getpid(), signal.SIGTERM)
         await asyncio.wait_for(serving, T)
         (srv,) = seen
-        assert srv.stuck_work_count == 1
+        assert srv._stuck_work_count == 1
         assert srv.state == "stopping" and _lock_view(srv, sock)
         gate.set()
         await asyncio.wait_for(srv.wait_stopped(), T)
@@ -935,7 +935,7 @@ async def test_every_serve_exit_settles_a_pending_step(sock, monkeypatch, stage,
         else:
             assert not t.done()
             assert srv.state == "stopping" and _lock_view(srv, sock)
-            assert srv.live_work_count >= 1 and srv.stuck_work_count >= 1
+            assert srv.live_work_count >= 1 and srv._stuck_work_count >= 1
             assert await _not_stopped_within(srv, 0.05)
             gate.set()
             await asyncio.wait_for(srv.wait_stopped(), T)
@@ -999,7 +999,7 @@ async def test_hard_exit_fires_on_any_live_entry_kind(monkeypatch):
         )
     assert info.value.args == (1,)
     (srv,) = seen
-    assert srv.stuck_work_count == 0 and srv.live_work_count == 1
+    assert srv._stuck_work_count == 0 and srv.live_work_count == 1
 
 
 async def test_healthy_cli_shutdown_leaves_no_live_work(sock, monkeypatch):
@@ -1167,9 +1167,10 @@ async def test_adopt_label_is_free_form_and_abandoned_is_opt_in():
     with pytest.raises(ValueError):
         srv.adopt(fut, label="")
     srv.adopt(fut, label="my warm-up")  # default: still awaited, not stuck
-    assert "1 adopted: my warm-up" in srv.live_work_reasons and srv.stuck_work_count == 0
+    assert "1 adopted: my warm-up" in srv.live_work_reasons and srv._stuck_work_count == 0
     srv.adopt(fut, abandoned=True)  # again: only adds the stuck mark
-    assert srv.live_work_count == 2 and srv.stuck_work_count == 1  # + the listener
+    assert srv.live_work_count == 2 and srv._stuck_work_count == 1  # + the listener
+    assert "1 adopted: my warm-up (1 stuck)" in srv.live_work_reasons
     fut.set_result(None)
     await asyncio.sleep(0)
     assert srv.live_work_count == 1
@@ -1221,11 +1222,12 @@ async def test_adopt_state_outcome_matrix(sock, caplog, state, outcome, abandone
     abandoned. Throughout: lock held iff live work (Unix-socket mode)."""
     b = Gated()
     srv, start_task = await _server_in(state, b, sock)
-    before_live, before_stuck = srv.live_work_count, srv.stuck_work_count
+    before_live, before_stuck = srv.live_work_count, srv._stuck_work_count
     assert _lock_view(srv, sock) is (before_live > 0)
     fut = _adoptee(outcome)
     with caplog.at_level(logging.ERROR, logger="stt_server"):
         if state in ("new", "stopped"):
+            assert not srv.can_adopt
             with pytest.raises(RuntimeError, match=f"adopt\\(\\) in state {state}"):
                 srv.adopt(fut, abandoned=abandoned, label="mine")
             assert srv.state == state and srv.live_work_count == 0
@@ -1234,8 +1236,10 @@ async def test_adopt_state_outcome_matrix(sock, caplog, state, outcome, abandone
             srv.adopt(fut, abandoned=abandoned, label="mine")
             pending = outcome == "pending"
             assert srv.live_work_count == before_live + pending
-            assert srv.stuck_work_count == before_stuck + (pending and abandoned)
-            assert ("1 adopted: mine" in srv.live_work_reasons) is pending
+            assert srv._stuck_work_count == before_stuck + (pending and abandoned)
+            mark = " (1 stuck)" if abandoned else ""
+            assert (f"1 adopted: mine{mark}" in srv.live_work_reasons) is pending
+            assert srv.can_adopt
     logged = "leftover task failed" in caplog.text
     assert logged is (state not in ("new", "stopped") and outcome == "done-failed" and abandoned)
     if outcome == "done-failed":
@@ -1313,12 +1317,12 @@ async def test_backend_decode_thread_keeps_the_lock(sock):
     await srv.shutdown()
     # One ledger: the thread holds the lock AND counts as stuck, so the CLI's
     # hard exit and the lock agree.
-    assert srv.stuck_work_count == 1
+    assert srv._stuck_work_count == 1
     assert srv.state == "stopping" and _lock_view(srv, sock)
     b.thread_done.set_result(None)
     await asyncio.wait_for(srv.wait_stopped(), T)
     assert srv.state == "stopped" and not _lock_view(srv, sock)
-    assert srv.stuck_work_count == 0
+    assert srv._stuck_work_count == 0
 
 
 async def test_decode_guard_idle_tracks_the_thread():

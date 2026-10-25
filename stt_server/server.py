@@ -434,8 +434,8 @@ _WORK_LABELS = {
 @dataclass
 class _Work:
     """One entry of the live-work ledger: what it is, whether it outlived the
-    bound its caller waited for (``stuck``: a diagnostic, counted by
-    ``stuck_work_count``), and the cleanup that must run when it completes,
+    bound its caller waited for (``stuck``: a diagnostic, shown as
+    ``(N stuck)`` in ``live_work_reasons``), and the cleanup that must run when it completes,
     before it leaves the ledger (``then``: it registers any successor work
     first, via ``_hand_off``, so the lock never falls between). A cleanup that
     raises keeps its entry in the ledger for good: fail closed. ``label``: an
@@ -501,8 +501,8 @@ class TranscriptionServer:
     4. A started backend is ``close()``d on every exit from ``start()`` that
        does not reach ``RUNNING``. Every wait on someone else's code (sessions,
        the listener's ``wait_closed``, ``backend.close()``) is bounded; what
-       outlives its bound stays in the ledger (marked stuck, a diagnostic:
-       ``stuck_work_count``). ``live_work_count`` is the ledger's size: the
+       outlives its bound stays in the ledger (marked stuck, a diagnostic
+       shown in ``live_work_reasons``). ``live_work_count`` is the ledger's size: the
        lock is held while it is non-zero, and it is what ``serve``'s hard exit
        reads, so an entry of any kind keeps both.
     5. Per-attempt state (listener, bound socket inode, backend close task,
@@ -516,16 +516,17 @@ class TranscriptionServer:
     - ``live_work_count`` / ``live_work_reasons``: what is still live. It is
       non-zero throughout ``running`` (the bound listener is an entry), so it
       is only meaningful after ``shutdown()``: non-zero then means leftovers
-      that keep the lock (what ``serve``'s hard exit reads).
-    - ``stuck_work_count``: diagnostic only (entries that outlived the bound
-      their caller waited for). Never decide anything on it.
+      that keep the lock (what ``serve``'s hard exit reads). A reason ending
+      ``(N stuck)`` counts entries that outlived the bound their caller
+      waited for: a diagnostic for logs, never a decision.
     - ``state`` / ``holds_socket_lock``: for logs and tests.
     - ``wait_closed()``: the current listener's close only (websockets'
       ``wait_closed``); not a lock or stop signal. Use ``wait_stopped()``.
     - ``adopt(task, abandoned=..., label=...)``: hand the server a task of
       yours that touches it or its backend, so the lock is kept until it ends.
-      Valid only in ``starting`` / ``running`` / ``stopping``; in ``new`` or
-      ``stopped`` (no lock held) it raises ``RuntimeError``. ``serve`` uses it
+      Valid only while ``can_adopt`` (``starting`` / ``running`` /
+      ``stopping``); otherwise (``new`` or ``stopped``: no lock held) it
+      raises ``RuntimeError``. ``serve`` uses it
       for its readiness step from creation and, ``abandoned=True``, for a
       startup or readiness step that ignored its cancel.
     """
@@ -543,8 +544,8 @@ class TranscriptionServer:
         # the socket or the backend -- a bind, the bound listener and its
         # close, session / decode tasks (from creation; no other registry), an
         # in-flight start or drain, a backend close, an adopted step, a
-        # backend worker thread. Both the lock decision (``_live_reasons``)
-        # and ``stuck_work_count`` are views of it; nothing else counts.
+        # backend worker thread. The lock decision (``_live_reasons``) and
+        # every public count are views of it; nothing else counts.
         self._live_work: dict[object, _Work] = {}
         # True once ``shutdown()`` was called (terminal; not per attempt).
         self._shutdown_requested = False
@@ -629,16 +630,19 @@ class TranscriptionServer:
         """Everything that can still touch the socket or the backend (the one
         live-work predicate, read from the one ledger; empty means the lock
         may be released)."""
-        counts: dict[tuple[str, str | None], int] = {}
+        counts: dict[tuple[str, str | None], list[int]] = {}
         for w in self._live_entries():
-            key = (w.kind, w.label)
-            counts[key] = counts.get(key, 0) + 1
+            n = counts.setdefault((w.kind, w.label), [0, 0])
+            n[0] += 1
+            n[1] += w.stuck
         reasons = []
-        for (kind, own), n in counts.items():
+        for (kind, own), (n, stuck) in counts.items():
             label = _WORK_LABELS.get(kind, kind)
             if own is not None:
                 label = f"{label}: {own}"
-            reasons.append(label if kind == "listener" else f"{n} {label}")
+            reason = label if kind == "listener" else f"{n} {label}"
+            # Entries that outlived the bound their caller waited for.
+            reasons.append(f"{reason} ({stuck} stuck)" if stuck else reason)
         return reasons
 
     def _begin_work(self) -> object:
@@ -732,7 +736,7 @@ class TranscriptionServer:
 
     def _linger(self, fut: asyncio.Future, kind: str) -> None:
         """``fut`` outlived the bound its caller waited for: it stays live work
-        (the lock outlives it) and counts in ``stuck_work_count``."""
+        (the lock outlives it) and is marked stuck."""
         self._track(fut, kind, stuck=True)
 
     def adopt(self, fut: asyncio.Future, *, abandoned: bool = False, label: str = "step") -> None:
@@ -740,8 +744,8 @@ class TranscriptionServer:
         counts as live work until it finishes, so the lock is kept meanwhile
         (and a failed start that sees it ends in ``stopping``, not ``new``).
 
-        Precondition: state ``starting``, ``running`` or ``stopping``. In
-        ``new`` or ``stopped`` it raises ``RuntimeError`` and records nothing:
+        Precondition: ``can_adopt`` (state ``starting``, ``running`` or
+        ``stopping``). In ``new`` or ``stopped`` it raises ``RuntimeError`` and records nothing:
         no lock is held there, so live work would either block a lock release
         that ``shutdown()`` needs (``new``: it would be refused) or run with
         the lock already released (``stopped``).
@@ -749,14 +753,15 @@ class TranscriptionServer:
         ``abandoned=False`` (default): you still await it (``serve``'s
         readiness step, from creation). ``abandoned=True``: you stopped
         waiting for it (``serve`` does this with a step that ignored its
-        cancel); it is marked stuck (``stuck_work_count``) and its failure is
+        cancel); it is marked stuck (``(N stuck)`` in ``live_work_reasons``) and
+        its failure is
         logged -- at once if it already failed. A future that is already done
         adds no live work. Adopting a task again only adds the stuck mark.
         ``label`` is your own short name for it (``live_work_reasons`` shows
         ``"1 adopted: <label>"``)."""
         if not isinstance(label, str) or not label.strip():
             raise ValueError("adopt(label=...) must be a non-empty string")
-        if self._state not in _ADOPTABLE_STATES:
+        if not self.can_adopt:
             raise RuntimeError(
                 f"stt_server: adopt() in state {self._state.value} refused; "
                 "valid only while starting, running or stopping"
@@ -766,6 +771,13 @@ class TranscriptionServer:
                 _log_leftover_failure(fut)
             return
         self._track(fut, "adopted", stuck=abandoned, label=label)
+
+    @property
+    def can_adopt(self) -> bool:
+        """True while ``adopt()`` is valid (a lock is held or being released:
+        ``starting``, ``running``, ``stopping``). Check it instead of
+        ``state`` before adopting."""
+        return self._state in _ADOPTABLE_STATES
 
     async def wait_stopped(self) -> None:
         """Wait until the server holds no lock and runs no work: state
@@ -1075,17 +1087,20 @@ class TranscriptionServer:
     @property
     def live_work_reasons(self) -> list[str]:
         """``live_work_count`` broken down by kind, for logs (e.g.
-        ``["listener bound", "1 session/decode tasks"]``); empty when none."""
+        ``["listener bound", "2 session/decode tasks (1 stuck)"]``); empty
+        when none. ``(N stuck)``: entries that outlived the bound their caller
+        waited for (a diagnostic, never a decision)."""
         return self._live_reasons()
 
     @property
-    def stuck_work_count(self) -> int:
-        """Diagnostic: the live entries marked as having outlived the bound
-        their caller waited for -- a session that swallowed or outlived
+    def _stuck_work_count(self) -> int:
+        """Diagnostic (tests): the live entries marked as having outlived the
+        bound their caller waited for -- a session that swallowed or outlived
         cancellation, a backend ``close()`` past its bound, a listener close
         past its grace, an orphan bind, an adopted startup / readiness step, a
         backend worker thread behind the ``idle()`` hook, a finished entry
-        whose cleanup failed. Never a lock or exit decision: those read
+        whose cleanup failed. Shown publicly as ``(N stuck)`` in
+        ``live_work_reasons``. Never a lock or exit decision: those read
         ``live_work_count``."""
         return sum(1 for w in self._live_entries() if w.stuck)
 
@@ -1115,7 +1130,7 @@ class TranscriptionServer:
           again) even when a session task swallows cancellation or ``close()``
           hangs. What is left running -- including any backend decode thread
           (``idle()`` hook) -- stays in the live-work ledger
-          (``live_work_count``; marked in ``stuck_work_count``) and the
+          (``live_work_count``; marked stuck in ``live_work_reasons``) and the
           single-server lock stays held until the last of it finishes, so no
           new server can take over the socket while this one's work still
           runs. The CLI (``serve`` with ``hard_exit_on_stop=True``) then exits
@@ -2014,8 +2029,8 @@ async def serve(
     a failure -- that finds a startup or readiness step still pending cancels
     it and waits for it at most the drain timeout before ``shutdown()``; one
     that outlives that is handed to the server (``TranscriptionServer.adopt``):
-    it keeps the lock until it ends (``live_work_count``; marked in
-    ``stuck_work_count``). The readiness step is live work from creation
+    it keeps the lock until it ends (``live_work_count``; marked stuck in
+    ``live_work_reasons``). The readiness step is live work from creation
     (``adopt(task, label=...)``). A cancel of ``serve`` landing while that
     bounded wait runs does not start a second one. ``serve`` uses only the
     server's public API, so an embedder can write the same loop.
@@ -2071,7 +2086,7 @@ async def serve(
             if task.done():
                 if not task.cancelled():
                     task.exception()  # retrieved; we are stopping regardless
-            elif server.state not in ("new", "stopped"):
+            elif server.can_adopt:
                 server.adopt(task, abandoned=True, label=stage)
             # Else only a startup step that never ran its first step is pending
             # (``start()`` leaves ``new`` / ``stopped`` synchronously):
