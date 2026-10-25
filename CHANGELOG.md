@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`docs/architecture.md`**: the server lifecycle state machine, the single-server lock, stop during startup, and the supervisor contract.
 - **`scripts/smoke_supervised.py`**: an opt-in end-to-end smoke test that drives `serve --supervised` the way a menubar app does (events, stops, parent death, second instance, stale socket, concurrent clients). See `docs/operations.md`.
 - **Single-server lock for Unix sockets.** `start()` takes an `flock` on
   `<socket>.lock` (mode `0600`, next to the socket) before the model loads, and

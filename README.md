@@ -358,6 +358,7 @@ Deeper references live under [`docs/`](docs/):
 
 - [Operations and deployment](docs/operations.md) — multi-backend operation, two-agent LaunchAgent install, A/B benchmarking, health checks, and Whisper hallucination-suppression knobs.
 - [Client and integration](docs/integration.md) — Python `TranscriptionClient` usage, the Pipecat `SegmentedSTTService` example, and the Koda reference consumer.
+- [Server architecture](docs/architecture.md) — the lifecycle state machine, the single-server lock, stop-during-startup, and what a supervisor can rely on.
 - [Protocol subset](docs/protocol.md) — the V1 wire events and how they deviate from the OpenAI Realtime transcription snapshot.
 - [Upgrading 0.1.x → 0.2.0](docs/migration.md) — runtime-surface rename migration.
 
