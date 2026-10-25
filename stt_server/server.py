@@ -910,7 +910,7 @@ class TranscriptionServer:
         the moment it exists -- as the bind's own cleanup, before the bind
         leaves the ledger.
         """
-        task = asyncio.ensure_future(coro)
+        task = asyncio.ensure_future(self._bound(coro))
         self._track(task, "bind")  # live work from creation
         try:
             server = await asyncio.shield(task)
@@ -926,6 +926,16 @@ class TranscriptionServer:
                 self._adopt_listener(task.result())
             raise
         self._adopt_listener(server)
+        return server
+
+    async def _bound(self, coro: Awaitable[Server]) -> Server:
+        """Await the listener bind, then record the socket inode in the same
+        step. Recording only after ``_bind`` resumes leaves a loop turn in
+        which a hard exit (a stop that wins the race with startup) finds a
+        bound socket whose inode is unrecorded, so ``abort_sync`` cannot prove
+        it is ours and leaves the file behind."""
+        server = await coro
+        self._record_bound_socket()
         return server
 
     def _adopt_listener(self, server: Server) -> None:

@@ -664,3 +664,28 @@ def test_probe_treats_a_foreign_owned_lock_as_not_held(tmp_path, monkeypatch):
         assert socket_lock_held(sock) is False
     finally:
         os.close(fd)
+
+
+async def test_hard_exit_right_after_bind_unlinks_the_socket(short_home, monkeypatch):
+    """A stop that wins the loop turn right after the bind must still remove
+    the socket file: the inode is recorded in the bind's own step, not only
+    once ``start()`` resumes, so ``abort_sync`` can prove it is ours."""
+    sock = short_home / "s" / "stt.sock"
+    srv = TranscriptionServer(EchoBackend(), ServerConfig(socket_path=str(sock)))
+    adopt = TranscriptionServer._adopt_listener
+    seen = {}
+
+    def _exit_before_adoption(self, server):
+        # What serve(hard_exit_on_stop=True) does the moment the stop wins.
+        assert self._bound_socket_id is not None
+        seen["existed"] = sock.exists()
+        self.abort_sync()
+        seen["left"] = sock.exists()
+        adopt(self, server)
+
+    monkeypatch.setattr(TranscriptionServer, "_adopt_listener", _exit_before_adoption)
+    try:
+        await srv.start()
+    finally:
+        await srv.shutdown()
+    assert seen == {"existed": True, "left": False}
