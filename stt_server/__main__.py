@@ -607,7 +607,9 @@ def _cmd_prefetch(args: argparse.Namespace) -> None:
     )
     from . import prefetch
 
-    model = None if args.backend == "echo" else _resolve_model(args.backend, args.model)
+    # Echo has no default model; an explicit ``--model`` reaches prefetch,
+    # which refuses it (ConfigError) rather than reporting it cached.
+    model = _resolve_model(args.backend, args.model)
     code = prefetch.run_prefetch(args.backend, model, check=args.check, json_mode=args.json)
     if code:
         raise SystemExit(code)

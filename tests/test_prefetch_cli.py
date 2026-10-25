@@ -228,6 +228,21 @@ def test_check_echo_is_always_cached(monkeypatch, capsys):
     ]
 
 
+@pytest.mark.parametrize("check", [True, False])
+@pytest.mark.parametrize("model", ["/definitely/missing/model", "some/repo"])
+def test_echo_refuses_an_explicit_model(monkeypatch, capsys, check, model):
+    """Echo takes no model: an explicit ``--model`` (local path or repo id) is
+    a ConfigError in check and fetch, never silently dropped and reported
+    cached / complete."""
+    argv = ["--backend", "echo", "--model", model, "--json"]
+    if check:
+        argv.append("--check")
+    code, events, _ = _run(monkeypatch, capsys, *argv)
+    assert code == 1
+    assert events[-1]["event"] == "error" and events[-1]["code"] == "ConfigError"
+    assert not any(e["event"] in ("summary", "complete") for e in events)
+
+
 def test_fetch_json_event_order(fake_hub, monkeypatch, capsys):
     monkeypatch.setattr(PF, "_PROGRESS_INTERVAL_S", 0.01)
     code, events, _ = _run(monkeypatch, capsys, "--backend", "parakeet", "--json")

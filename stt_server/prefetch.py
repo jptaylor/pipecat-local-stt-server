@@ -101,9 +101,12 @@ def is_local_model(model: str) -> bool:
 
 
 def _module_specs(loaded, model: str | None) -> list[SnapshotSpec]:
-    """The imported backend module's ``prefetch_specs(model)`` (none for echo)."""
+    """The imported backend module's ``prefetch_specs(model)`` (none for echo,
+    which takes no model: an explicit one is refused, never ignored)."""
     if loaded.module is None:
-        return []  # echo: no model
+        if model is not None:
+            raise ConfigError(f"the echo backend takes no model (got {model!r}); drop --model")
+        return []
     return list(loaded.module.prefetch_specs(model))
 
 
