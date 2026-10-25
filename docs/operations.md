@@ -236,6 +236,25 @@ from a LaunchAgent keepalive script. The existing `--socket-path`/`--host`/
 `--port`/`--auth-token-file` endpoint flags work for both `serve` and
 `status` subcommands.
 
+## Supervised smoke test
+
+`scripts/smoke_supervised.py` drives `serve --supervised` the way a menubar or
+other supervising app does: it spawns real server processes and checks the JSON
+`ready`/`error` events, stdin-EOF and SIGTERM stops (including during warm-up),
+a parent that dies, a second instance on a live socket, a stale socket after
+`kill -9`, concurrent clients, and a real transcription. It is opt-in (not in CI
+or pytest) and needs the backend's extra installed; run it with that
+environment's interpreter:
+
+```bash
+.venv/bin/python scripts/smoke_supervised.py --backend echo
+.venv/bin/python scripts/smoke_supervised.py --backend mlx \
+    --model mlx-community/whisper-large-v3-turbo-q4
+```
+
+It exits 0 only if every scenario passes, and 2 (running nothing) when the
+model is not cached: `prefetch` it first.
+
 ## Trust model and socket security (same-host UDS)
 
 The Unix-domain-socket transport is hardened on the server side by two
