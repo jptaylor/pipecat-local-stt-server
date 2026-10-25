@@ -56,6 +56,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `kyutai/stt-1b-en_fr-mlx`, English + French, CC-BY-4.0). The extra is declared
   conflicting with `mlx` / `parakeet` / `nemotron` (moshi_mlx pins `mlx<0.27`,
   `huggingface-hub<0.29`), so the lockfile keeps their newer pins.
+- `TranscriptionServer.adopt(task, abandoned=..., label=...)`: registers a
+  task of yours as live work, keeping the single-server lock until it ends.
+- `TranscriptionServer.can_adopt`: whether `adopt()` is valid now (`starting`,
+  `running` or `stopping`); otherwise `adopt()` raises `RuntimeError`.
+- `TranscriptionServer.live_work_count`: size of the live-work ledger; the lock
+  is held while it is non-zero (read it after `shutdown()`).
+- `TranscriptionServer.live_work_reasons`: `live_work_count` by kind, for logs;
+  `(N stuck)` marks entries that outlived the bound their caller waited for.
+- `TranscriptionServer.backend` and `TranscriptionServer.config`: read-only.
 
 ### Changed
 
@@ -153,54 +162,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cancelled `shutdown()` no longer abandons `backend.close()` and later
   callers wait for it; and `serve` keeps a startup/readiness step that ignored
   its cancel as live work (lock held until it ends, its failure logged).
-- Live work is one ledger: the lock decision and the CLI's hard exit
-  (`live_work_count`) read it, and `stuck_work_count` is a diagnostic view of
-  it, so they can no longer disagree. A bind that finished after a second
-  cancel, its listener's close, and a backend decode thread are now live
-  work; sessions are live
-  work from creation; an orphaned listener keeps the lock until its socket has
-  really closed. A failed start that returns to `new` resets every per-attempt
-  slot, so a retry closes its backend again (it reused the first attempt's
-  finished close, leaving the backend open) and never acts on the first
-  attempt's socket inode. An entry stays live until its own cleanup has run,
-  not just until its future is done, so another piece of work ending in the
-  same loop tick can no longer release the lock before an orphan bind's
-  listener is closed and unlinked; every task the server creates (the bind,
-  the listener's `wait_closed`, which now lingers past its grace instead of
-  being cancelled) is live work from creation; and session / decode tasks
-  are registered only in the ledger.
-- The lock fails closed on every exit path: a ledger entry whose own cleanup
-  raises (an orphaned listener whose `close()` failed, still serving) stays
-  live, marked stuck, instead of being dropped and releasing the lock; a
-  `then` cleanup given for an already-finished future runs at once instead of
-  being dropped; the successor-before-predecessor handoff (bound listener to
-  its close) is one primitive. Cancelling `serve` itself now settles a pending
-  startup / readiness step the way a stop does (cancel, bounded wait, keep one
-  that outlives it as live work) instead of leaving it running while the
-  backend closed and the lock was released; the readiness step is live work
-  from creation. The CLI's hard exit reads the whole ledger
-  (`TranscriptionServer.live_work_count`, new) rather than
-  `stuck_work_count`, which is now only a diagnostic, so no entry kind can hold
-  the lock without triggering it.
+- The single-server lock is held while any live work remains: a bind that
+  finished after a second cancel, its listener's close, the listener's
+  `wait_closed` (which lingers past its grace instead of being cancelled), a
+  backend decode thread, and session / decode tasks from creation. An
+  orphaned listener keeps the lock until its socket has really closed. Work
+  stays live until its own cleanup has run, so other work ending in the same
+  loop tick cannot release the lock before an orphan bind's listener is
+  closed and unlinked. A failed start that returns to `new` resets every
+  per-attempt slot, so a retry closes its own backend and never acts on the
+  first attempt's socket inode.
+- The lock fails closed on every exit path: work whose own cleanup raises (an
+  orphaned listener whose `close()` failed, still serving) stays live and
+  keeps the lock, and a cleanup given for an already-finished future runs at
+  once. Cancelling `serve` itself settles a pending startup / readiness step
+  the way a stop does (cancel, bounded wait, keep one that outlives it as
+  live work) instead of leaving it running while the backend closes and the
+  lock is released. The lock and the CLI's hard exit both read
+  `live_work_count`, so live work of any kind triggers the hard exit; the
+  stuck mark in `live_work_reasons` is a diagnostic only.
 - `prefetch --check --backend mlx` counts a snapshot complete only with the
   files `mlx_whisper` opens (`config.json` and `weights.safetensors` or
   `weights.npz`); a `weights.*` glob accepted e.g. `weights.txt`.
   Alternatives in `SnapshotSpec.required` are a tuple entry, not an `a|b`
-  string, and a weight filename read from a Kyutai `config.json` may not
-  contain `|`, so such a name can no longer pass `--check` on another file.
-- `serve` uses only `TranscriptionServer`'s public API, so an embedder can
-  write the same loop: `adopt(task, label="...")` registers a step as live
-  work (`abandoned=True` for one you stopped waiting for: marked stuck, its
-  failure logged, at once if it already failed), and `live_work_reasons` (new)
-  names what is live. `adopt()` is valid only while `starting`, `running` or
-  `stopping`; in `new` or `stopped` (no lock held) it raises `RuntimeError`,
-  so it can no longer make `shutdown()` fail before `start()` or run work
-  after the lock is released. Which signal to read (`wait_stopped()` to wait;
-  `live_work_count` only after `shutdown()`; `stuck_work_count` diagnostic;
-  `wait_closed()` the listener only) is documented once, in the class
-  docstring. Its two hard exits are one routine. A cancel of
-  `serve` landing during a stop's bounded wait on a startup / readiness step
-  no longer starts a second full drain-timeout wait.
+  string. A Kyutai `config.json` weight filename containing `|` (e.g.
+  `model.q8.safetensors|config.json`) is refused: `prefetch --check` reports
+  `cached: false` and a fetch fails with `ModelInvalidError` ("config.json
+  names an invalid file"), instead of passing on `config.json` alone.
+- `serve` uses only `TranscriptionServer`'s public API (`adopt()`,
+  `can_adopt`, `live_work_count`, `live_work_reasons`), so an embedder can
+  write the same loop; which signal to read is documented once, in the class
+  docstring. `adopt()` in `new` or `stopped` raises `RuntimeError` instead of
+  making `shutdown()` fail or running work after the lock is released. A
+  cancel of `serve` during a stop's bounded wait on a startup / readiness
+  step does not start a second full drain-timeout wait.
+- `serve` removes the SIGINT / SIGTERM handlers it installed on every return
+  or raise, so after a failed start the process no longer survives SIGTERM.
+- `prefetch --backend echo --model X` fails with `ConfigError` (exit 1)
+  instead of ignoring the model and reporting it cached.
 - `serve`: when `shutdown()` also fails after `serve` was already failing, the
   first failure is raised (and handed to `on_fatal`); the shutdown failure is
   logged instead of replacing it.
@@ -215,8 +214,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-regular or foreign-owned file as "not held" instead of hanging or
   reporting a spurious running server.
 - `TranscriptionServer.listening_port()` returns `None` for a Unix socket
-  instead of a character of its path. `TranscriptionServer` exposes read-only
-  `backend` and `config`.
+  instead of a character of its path.
 
 ## [0.3.3] - 2026-06-28
 

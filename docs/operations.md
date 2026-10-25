@@ -48,21 +48,27 @@ live server whose listen backlog is full is never mistaken for a stale socket.
   a contended lock for 250 ms, so the check never makes a real start fail. It
   opens the file non-blocking and treats anything but a plain file you own as
   "not held" (the real start then refuses it), so a planted FIFO cannot hang it.
-- If a session task ignores cancellation past the shutdown grace, a decode
-  thread is still running on the GPU after its task was cancelled,
-  `backend.close()` is still running past its bound (the drain timeout, 10 s),
-  the listener's close has not completed (a connection handler that will not
-  finish keeps it open past its grace), or a startup / readiness step ignored
-  `serve`'s cancel (a stop, or `serve` itself being cancelled), the lock stays
-  held until that work finishes. A cleanup that fails (an orphaned listener
-  whose close raised) keeps it held until the process exits (also when the shutdown itself
-  was cancelled, or when the work was left by a failed start: that server then
-  stays `stopping` and is single-use, while a failed start that left nothing
-  running returns to `new` and may be retried). In-process callers await
-  `TranscriptionServer.wait_stopped()` for the lock to be free: `shutdown()`
-  returning does not guarantee it;
-  `python -m stt_server serve` exits the process at that point,
-  which releases it. A failure in flight at that exit (for example
+- The lock stays held while the server still has work that can touch the
+  socket or the backend:
+  - **Work that outlived its grace or bound** keeps it until that work
+    finishes: a session task that ignores cancellation past the shutdown
+    grace, a decode thread still running on the GPU after its task was
+    cancelled, `backend.close()` running past its bound (the drain timeout,
+    10 s), a listener close that has not completed (a connection handler that
+    will not finish keeps it open past its grace), or a startup / readiness
+    step that ignored `serve`'s cancel (a stop, or `serve` itself being
+    cancelled). This holds also when the shutdown itself was cancelled.
+  - **A cleanup that raises** (an orphaned listener whose close failed) keeps
+    it until the process exits.
+  - **A failed start that left work running** keeps it the same way; that
+    server stays `stopping` and is single-use.
+  - **A failed start that left nothing running** releases it: the server
+    returns to `new` and may be retried.
+
+  In-process callers await `TranscriptionServer.wait_stopped()` for the lock
+  to be free: `shutdown()` returning does not guarantee it.
+  `python -m stt_server serve` exits the process at that point, which
+  releases it. A failure in flight at that exit (for example
   `backend.close()` raising) is still printed and, under `--supervised`,
   emitted as the `error` event, with exit status 1.
 - **Mixed versions during an upgrade.** The lock only protects against servers
