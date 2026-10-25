@@ -1977,7 +1977,9 @@ async def serve(
     ``ready`` performs asynchronous readiness preparation such as model warm-up;
     ``publish_ready`` performs the final synchronous notification after a stop
     check. ``stop_on_stdin_eof`` (``serve --supervised``) treats stdin EOF like
-    SIGTERM.
+    SIGTERM. The SIGINT / SIGTERM handlers ``install_signal_handlers`` adds
+    are removed on every return or raise from ``serve`` (a failed start
+    included), restoring the default action.
 
     A stop (signal, or stdin EOF) that arrives while startup or readiness
     preparation is pending:
@@ -2094,18 +2096,23 @@ async def serve(
         await task
         return not stop.done()
 
-    if install_signal_handlers:
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(sig, _request_stop)
-            except NotImplementedError:
-                pass
-    if stop_on_stdin_eof:
-        from .supervise import watch_stdin_eof
-
-        watch_stdin_eof(loop, _request_stop)
+    # The signals ``serve`` captured: released on every exit from ``serve``
+    # (the outermost ``finally``), so a returned or failed ``serve`` never
+    # leaves SIGINT / SIGTERM resolving a stop nobody awaits.
+    captured: list[signal.Signals] = []
     failure: BaseException | None = None
     try:
+        if install_signal_handlers:
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    loop.add_signal_handler(sig, _request_stop)
+                except NotImplementedError:
+                    continue
+                captured.append(sig)
+        if stop_on_stdin_eof:
+            from .supervise import watch_stdin_eof
+
+            watch_stdin_eof(loop, _request_stop)
         # Race startup against stop in every mode: the signal handlers above are
         # installed before ``start()``, so awaiting it bare would defer a
         # SIGTERM/SIGINT until the backend import finished (``main`` installed
@@ -2148,6 +2155,8 @@ async def serve(
                     ", ".join(server.live_work_reasons),
                 )
                 _exit_process(1 if failure is not None else 0, abort=False, failure=failure)
+            for sig in captured:
+                loop.remove_signal_handler(sig)
 
 
 def _report_before_hard_exit(

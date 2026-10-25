@@ -1499,3 +1499,35 @@ def test_cli_stuck_work_exit_still_reports_the_failure():
     assert events and events[-1]["event"] == "error"
     assert events[-1]["code"] == "BackendStartError"
     assert "metal teardown failed" in events[-1]["message"]
+
+
+@pytest.mark.parametrize("exit_path", ["start-fails", "stop"])
+async def test_serve_releases_its_signal_handlers_on_every_exit(sock, exit_path):
+    """The SIGINT / SIGTERM handlers ``serve`` installs are removed whenever it
+    returns or raises: a dead ``serve`` must not keep swallowing signals (an
+    embedder's process would then survive SIGTERM)."""
+    import os
+    import signal
+
+    class StartFails(EchoBackend):
+        async def start(self) -> None:
+            raise RuntimeError("start boom")
+
+    loop = asyncio.get_running_loop()
+    try:
+        if exit_path == "start-fails":
+            with pytest.raises(RuntimeError, match="start boom"):
+                await asyncio.wait_for(S.serve(StartFails(), socket_path=str(sock)), T)
+        else:
+            up = asyncio.Event()
+            serving = asyncio.ensure_future(
+                S.serve(EchoBackend(), socket_path=str(sock), publish_ready=lambda _s: up.set())
+            )
+            await asyncio.wait_for(up.wait(), T)
+            os.kill(os.getpid(), signal.SIGTERM)
+            await asyncio.wait_for(serving, T)
+        assert loop.remove_signal_handler(signal.SIGTERM) is False
+        assert loop.remove_signal_handler(signal.SIGINT) is False
+    finally:
+        loop.remove_signal_handler(signal.SIGTERM)
+        loop.remove_signal_handler(signal.SIGINT)
