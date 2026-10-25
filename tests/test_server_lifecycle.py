@@ -157,9 +157,9 @@ class CloseFailsOnce(Gated):
 async def test_retry_after_a_failed_start_closes_the_backend_again(
     sock, monkeypatch, first_close_fails
 ):
-    """Codex HIGH: the failed start's finished ``_close_task`` survived the
-    return to ``new``; the retry's shutdown reused it and never closed the
-    backend (starts=2, closes=1), or re-raised the first close's failure."""
+    """A failed start's close is per-attempt state: a retry after the return
+    to ``new`` closes its own backend (starts == closes) and never re-raises
+    the first attempt's close failure."""
     b = CloseFailsOnce() if first_close_fails else Gated()
     real_bind = S.ws_unix_serve
     failures = [OSError("bind failed")]
@@ -182,9 +182,9 @@ async def test_retry_after_a_failed_start_closes_the_backend_again(
 
 
 async def test_failed_start_resets_every_per_attempt_slot(sock, monkeypatch):
-    """Security minor: the bound-socket inode and ``_server`` (and the close
-    task, the shutdown event) survived a failed start's
-    return to ``new``, so a retry's drain could act on attempt 1's inode."""
+    """A failed start's return to ``new`` clears the bound-socket inode and
+    ``_server`` (and the close task, the shutdown event), so a retry's drain
+    never acts on attempt 1's inode."""
     monkeypatch.setattr(S, "_CANCEL_GRACE_SECONDS", 0.05)
     srv = _server(Gated(), sock, drain_timeout_seconds=0.05)
 
@@ -227,7 +227,8 @@ def _at_rest(value):
 
 
 def _assert_attempt_is_fresh(srv: TranscriptionServer) -> None:
-    """Architecture minor: a structural guard, not a hand-kept slot list."""
+    """Every per-attempt slot is reset on the return to ``new`` (a structural
+    guard, not a hand-kept slot list)."""
     fresh = TranscriptionServer(srv.backend, srv.config)
     assert set(vars(srv)) == set(vars(fresh)), "a slot was created outside __init__"
     # Every per-attempt slot is assigned by ``_reset_attempt`` itself, so the
@@ -361,8 +362,8 @@ async def test_concurrent_shutdown_waits_for_the_first_drain(sock):
 
 
 async def test_cancel_during_drain_keeps_the_lock_while_sessions_run(sock):
-    """Codex HIGH: a cancel in the first drain wait released the lock while
-    session tasks that were never cancelled kept running."""
+    """A cancel in the first drain wait keeps the lock until every session
+    task (cancelled or not) has ended."""
     srv = _server(Gated(), sock, drain_timeout_seconds=60)
     await srv.start()
     entered, release = asyncio.Event(), asyncio.Event()
@@ -416,8 +417,8 @@ class HangingClose(Gated):
 
 
 async def test_hung_backend_close_is_bounded_and_keeps_the_lock(sock):
-    """Codex medium: ``close()`` was awaited with no bound, so a hung close
-    held shutdown (and the CLI's hard exit) forever."""
+    """``backend.close()`` is bounded: a hung close cannot hold ``shutdown()``
+    (or the CLI's hard exit); it stays live work holding the lock."""
     b = HangingClose()
     srv = _server(b, sock, drain_timeout_seconds=0.1)
     await srv.start()
@@ -478,9 +479,9 @@ def _slow_tail_bind(monkeypatch, on_bound):
 
 
 async def test_second_cancel_during_bind_never_orphans_the_listener(sock, monkeypatch):
-    """Codex high: the cleanup wait after the first cancel was not shielded; a
-    second cancel left the bind running, start() went back to ``new`` and
-    released the lock, and the bind then returned a listener nobody owned."""
+    """A second cancel mid-bind cannot orphan a listener: the bind stays live
+    work, ``start()`` does not return to ``new`` or release the lock, and the
+    listener the bind returns is closed while the lock is still held."""
 
     async def nothing(listener):
         return None
@@ -522,10 +523,10 @@ async def test_second_cancel_during_bind_never_orphans_the_listener(sock, monkey
 
 
 async def test_orphan_bind_keeps_the_lock_until_its_cleanup_ran(sock, monkeypatch):
-    """Codex high: the ledger dropped a future the moment it was done, before
-    its done-callbacks ran. Another entry ending in the same loop tick then
-    released the lock (and reset the attempt) before the orphan bind's cleanup
-    had closed its listener; the cleanup later unlinked with no lock held.
+    """An entry stays live until its own cleanup has run, not merely until its
+    future is done: another entry ending in the same loop tick cannot release
+    the lock (or reset the attempt) before the orphan bind's cleanup has
+    closed and unlinked its listener.
 
     Deterministic: the bind finishes a second tracked future right before it
     returns, so both futures' callbacks are queued in one tick, the other
@@ -580,10 +581,9 @@ async def _not_stopped_within(srv: TranscriptionServer, seconds: float) -> bool:
 
 
 async def test_a_failing_orphan_cleanup_keeps_the_lock(sock, monkeypatch, caplog):
-    """Codex high: ``_retire`` dropped the entry in a ``finally`` even when its
-    cleanup raised. An orphan bind whose ``listener.close()`` failed left the
-    listener serving, the ledger empty, and the lock released. Fail closed:
-    the bind stays live (stuck), the lock stays held, ``wait_stopped`` waits."""
+    """A cleanup that raises fails closed: an orphan bind whose
+    ``listener.close()`` failed (listener still serving) stays live (stuck),
+    the lock stays held, and ``wait_stopped`` waits."""
 
     async def nothing(listener):
         return None
@@ -633,9 +633,9 @@ async def test_a_failing_orphan_cleanup_keeps_the_lock(sock, monkeypatch, caplog
 
 
 async def test_a_then_for_a_done_future_runs_now_and_fails_closed(sock, caplog):
-    """Architecture minor: ``_track`` silently dropped a ``then`` given for an
-    already-done future, so its cleanup (registering successor work) never
-    ran. It runs at once, through ``_retire``; a failing one fails closed."""
+    """A ``then`` given to ``_track`` for an already-done future runs at once,
+    through ``_retire`` (so its successor work is registered); a failing one
+    fails closed."""
     srv = _server(Gated(), sock)
     await srv.start()
     loop = asyncio.get_running_loop()
@@ -664,11 +664,10 @@ async def test_a_then_for_a_done_future_runs_now_and_fails_closed(sock, caplog):
 
 
 async def test_every_server_task_is_live_work_until_it_completes(sock):
-    """Codex medium: the listener's ``wait_closed`` task (and before it, the
-    normal bind task) was created outside the ledger, so the lock could be
-    released while websockets' close (and the handshakes it waits for) still
-    ran. Every task the server creates must be in ``_live_work`` from creation
-    until it completes."""
+    """Every task the server creates (the bind, the listener's
+    ``wait_closed``) is in ``_live_work`` from creation until it completes, so
+    the lock is never released while websockets' close (and the handshakes it
+    waits for) still runs."""
     import os
     import sys
 
@@ -720,9 +719,9 @@ async def test_every_server_task_is_live_work_until_it_completes(sock):
 @pytest.mark.parametrize("trigger", ["shutdown", "cancel"])
 @pytest.mark.parametrize("session", ["prompt", "stubborn"])
 async def test_failed_start_drains_the_sessions_it_accepted(sock, monkeypatch, trigger, session):
-    """Codex high: the listener accepts before ``running``; the failed-start
-    unwind closed it but never drained the sessions, so the lock was released
-    while one still used the backend."""
+    """The listener accepts before ``running``, so a failed-start unwind
+    drains the sessions it accepted before releasing the lock (none still
+    uses the backend once the lock is free)."""
     monkeypatch.setattr(S, "_CANCEL_GRACE_SECONDS", 0.05)
     srv = _server(Gated(), sock, drain_timeout_seconds=0.05)
     release, sessions = asyncio.Event(), []
@@ -801,9 +800,8 @@ async def test_release_is_refused_while_live_work_remains(sock):
 
 
 async def test_a_session_is_live_work_from_creation(sock):
-    """Architecture minor: a live session counted only through a side set no
-    callback re-settled; it must be in the one ledger from creation, so its
-    end alone moves ``stopping`` to ``stopped``."""
+    """A live session is in the one ledger from creation, so its end alone
+    moves ``stopping`` to ``stopped``."""
     from websockets.asyncio.client import unix_connect
 
     srv = _server(Gated(), sock)
@@ -824,9 +822,9 @@ async def test_a_session_is_live_work_from_creation(sock):
 
 
 async def test_soft_stop_keeps_an_uncancellable_readiness_step(sock, monkeypatch, caplog):
-    """Codex medium: after its bounded wait, a soft stop dropped a readiness
-    task that ignored cancellation; serve returned, the lock was released, and
-    the task later failed unobserved (and could still touch the backend)."""
+    """A readiness task that ignores a soft stop's cancel outlives the bounded
+    wait as live work: the lock stays held until it ends, and its later
+    failure is logged."""
     import functools
     import os
     import signal
@@ -868,12 +866,11 @@ async def test_soft_stop_keeps_an_uncancellable_readiness_step(sock, monkeypatch
 @pytest.mark.parametrize("trigger", ["cancel", "stop"])
 @pytest.mark.parametrize("step", ["prompt", "stubborn"])
 async def test_every_serve_exit_settles_a_pending_step(sock, monkeypatch, stage, trigger, step):
-    """Codex high: cancelling ``serve`` itself (not a stop) left the startup /
-    readiness task running, unawaited and outside the ledger; ``shutdown()``
-    then closed the backend under it and released the lock. Every exit
-    (stop or cancel) x step (finishes promptly when cancelled, or ignores it)
-    must cancel the step, wait for it (bounded), and keep one that outlives
-    that as live work holding the lock."""
+    """Every ``serve`` exit (stop or cancel of ``serve`` itself) x step
+    (finishes promptly when cancelled, or ignores it) cancels the pending
+    startup / readiness step, waits for it (bounded), and keeps one that
+    outlives that as live work holding the lock -- the backend is never
+    closed, nor the lock released, under a running step."""
     import functools
     import os
     import signal
@@ -966,10 +963,9 @@ async def test_serve_failure_during_readiness_leaves_no_live_work(sock):
 
 
 async def test_hard_exit_fires_on_any_live_entry_kind(monkeypatch):
-    """Architecture minor: the hard exit read ``stuck_work_count``, kept equal
-    to "lock held" by a sweep that skipped non-future entries, so a leftover
-    non-future entry (here a step token that never ended) held the lock while
-    the CLI did not exit. The exit now reads the whole ledger."""
+    """The hard exit reads the whole ledger (``live_work_count``): any leftover
+    entry, including a non-future one (here a step token that never ended),
+    that holds the lock also triggers the CLI's exit."""
 
     class Exited(BaseException):
         pass
@@ -1003,9 +999,9 @@ async def test_hard_exit_fires_on_any_live_entry_kind(monkeypatch):
 
 
 async def test_healthy_cli_shutdown_leaves_no_live_work(sock, monkeypatch):
-    """Codex medium: nothing proved a clean stop under the CLI's
-    ``hard_exit_on_stop=True`` returns normally (no ``os._exit``) with the
-    ledger empty, with an idle client and one mid-utterance connected."""
+    """A clean stop under the CLI's ``hard_exit_on_stop=True`` returns
+    normally (no ``os._exit``) with the ledger empty, with an idle client and
+    one mid-utterance connected."""
     import os
     import signal
 
@@ -1048,9 +1044,9 @@ async def test_healthy_cli_shutdown_leaves_no_live_work(sock, monkeypatch):
 
 
 async def test_cancel_during_stop_wait_does_not_restart_it(sock, monkeypatch):
-    """Logic minor: a cancel of ``serve`` landing while a stop's bounded wait
-    on a stubborn readiness step ran made ``serve``'s ``finally`` wait a second
-    full drain timeout. The exit is bounded by ONE drain timeout."""
+    """A cancel of ``serve`` landing while a stop's bounded wait on a stubborn
+    readiness step runs does not start a second wait in ``serve``'s
+    ``finally``: the exit is bounded by ONE drain timeout."""
     import functools
     import os
     import signal
@@ -1147,7 +1143,7 @@ async def test_both_hard_exits_share_one_routine(monkeypatch, path):
 
 
 def test_serve_uses_only_the_public_server_api():
-    """Architecture: ``serve`` is the reference embedder loop, so it must not
+    """``serve`` is the reference embedder loop, so it must not
     reach into ``TranscriptionServer`` privates; and the ledger has one
     removal path (``_end_work``)."""
     import inspect
@@ -1284,9 +1280,10 @@ async def test_serve_rejects_on_fatal_without_hard_exit():
 
 
 async def test_serve_keeps_the_primary_failure_when_shutdown_also_fails(caplog):
-    """Codex medium: a failing ``shutdown()`` (here the backend close) in
-    ``serve``'s cleanup replaced the readiness failure that caused the stop,
-    so the caller / ``on_fatal`` classified the wrong error."""
+    """When ``shutdown()`` (here the backend close) also fails in ``serve``'s
+    cleanup, the readiness failure that caused the stop is the one raised
+    (and classified by the caller / ``on_fatal``); the shutdown failure is
+    only logged."""
 
     class BadClose(Gated):
         async def close(self):

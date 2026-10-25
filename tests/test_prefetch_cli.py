@@ -467,9 +467,9 @@ def test_local_model_uses_backend_required_patterns(tmp_path, monkeypatch, capsy
 def test_mlx_complete_means_the_files_its_loader_opens(
     tmp_path, monkeypatch, capsys, weights, cached
 ):
-    """Codex medium: ``required=("config.json", "weights.*")`` reported a
-    snapshot cached when it held no ``weights.safetensors`` / ``weights.npz``,
-    the only two files ``mlx_whisper.load_models.load_model`` opens."""
+    """An mlx snapshot is complete only with ``config.json`` and
+    ``weights.safetensors`` or ``weights.npz`` (the only two weight files
+    ``mlx_whisper.load_models.load_model`` opens); no ``weights.*`` glob."""
     model = tmp_path / "custom"
     (model / weights).parent.mkdir(parents=True, exist_ok=True)
     (model / "config.json").write_text("{}")
@@ -591,8 +591,8 @@ def test_kyutai_glob_config_never_reads_as_cached(tmp_path, monkeypatch, capsys)
 
 @pytest.mark.parametrize("check", [True, False])
 def test_unexpandable_tilde_model_is_a_missing_local_model(monkeypatch, capsys, check):
-    """Codex medium: ``~nobody/x`` raised ``RuntimeError`` from ``expanduser``
-    and surfaced as BackendStartError instead of a missing local model."""
+    """``~nobody/x`` (``expanduser`` raises ``RuntimeError``) is a missing
+    local model, not a BackendStartError."""
     argv = ["--backend", "mlx", "--model", "~no_such_user_7f3a_r8/model", "--json"]
     if check:
         argv.append("--check")
@@ -605,9 +605,9 @@ def test_unexpandable_tilde_model_is_a_missing_local_model(monkeypatch, capsys, 
 
 
 def test_kyutai_pipe_name_never_reads_as_cached(tmp_path, monkeypatch, capsys):
-    """Round 8: ``|`` used to be an in-band alternatives delimiter, so a config
-    naming ``model.q8.safetensors|config.json`` passed completeness on
-    ``config.json`` alone while the loader requests the literal name."""
+    """``|`` is not an alternatives delimiter: a config naming
+    ``model.q8.safetensors|config.json`` never passes completeness on
+    ``config.json`` alone (the loader requests the literal name)."""
     snap = tmp_path / "snap"
     snap.mkdir()
     (snap / "config.json").write_text(
@@ -660,8 +660,8 @@ def _mlx_hub(tmp_path, monkeypatch, weights: str):
 def test_mlx_weight_alternatives_through_hub_check_and_fetch(
     tmp_path, monkeypatch, capsys, weights, ok
 ):
-    """Codex low: the ``weights.safetensors``/``weights.npz`` alternative must
-    hold for every consumer (Hub fetch validation, Hub check), not only a local
+    """The ``weights.safetensors``/``weights.npz`` alternative holds for every
+    consumer (Hub fetch validation, Hub check), not only a local
     ``--check``."""
     _mlx_hub(tmp_path, monkeypatch, weights)
     code, events, _ = _run(monkeypatch, capsys, "--backend", "mlx", "--json")
