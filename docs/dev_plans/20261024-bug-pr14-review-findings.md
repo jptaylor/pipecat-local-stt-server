@@ -544,9 +544,41 @@ that did not fail closed. Fixed together:
   (unreachable with the real `start()`, and now refused); it uses the real
   `start()` on TCP port 0.
 
+### Round 10
+
+- **`serve` releases its signal handlers.** Root cause: `serve` installed
+  SIGINT / SIGTERM with `loop.add_signal_handler` and never removed them, so
+  after a failed start (or any return) SIGTERM resolved a stop future nobody
+  awaited and the process survived it. Old invariant: "handlers live for the
+  loop". New: "handlers `serve` installed are removed on every return or
+  raise from it" (installed inside the `try`, removed from the outermost
+  `finally`). Test: start-fails and stop exits, `remove_signal_handler`
+  returns False afterwards; mutation (no removal) fails both.
+- **One adopt precondition.** `_abandon_step`'s literal `("new", "stopped")`
+  duplicated `_ADOPTABLE_STATES`; the public `can_adopt` property is derived
+  from it and read by `adopt()` itself and by `serve`. The adopt matrix
+  asserts `can_adopt` per state; mutation (`can_adopt` true in `new`) fails 8.
+- **`stuck_work_count` folded into `live_work_reasons`.** It had no
+  production reader. The stuck mark is now part of each reason
+  (`"2 session/decode tasks (1 stuck)"`), so `serve`'s hard-exit log shows
+  it; the counter is the private `_stuck_work_count` (tests only). Swept:
+  server docstrings, tests (lifecycle, socket lock), CHANGELOG; README and
+  operations.md never named it. Mutation (no suffix) fails 6.
+- **Echo prefetch refuses an explicit `--model`.** `_cmd_prefetch` replaced
+  any echo model with `None`, so it reported cached / complete. The model now
+  reaches `_module_specs`, which raises `ConfigError` for echo (repo id and
+  local path alike: echo's entry allows local paths, so the refusal is in
+  `_module_specs`, not `local_specs_for`). Test: 4 cases (check/fetch x
+  path/repo id); mutation fails all 4.
+- Docs: CHANGELOG [Unreleased] Fixed bullets state final-state rules; the new
+  public API moved to Added (`listening_port()` stays in Fixed: it existed in
+  0.3.3, only its Unix-socket return changed); the Kyutai `|` bullet names
+  the refused input and the error. operations.md lists the held-lock causes.
+  Test docstrings state the invariant pinned instead of review-round labels.
+
 ## Final Results
 
 - All phases and follow-ups complete on `fix/pr14-review-findings`, including
-  the round-2 to round-9 fixes; Ruff format/check clean; full suite 633 passed, 3 skipped,
+  the round-2 to round-10 fixes; Ruff format/check clean; full suite 639 passed, 3 skipped,
   1 failed: the pre-existing, unrelated
   `tests/test_justfile_recipes.py::test_stt_list_prints_socket_in_tilde_form`.
