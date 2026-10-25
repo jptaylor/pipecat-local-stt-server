@@ -292,8 +292,9 @@ def s_prefetch():
         r.returncode == 0 and bool(lines) and lines[-1].get("event") == "complete",
         f"rc={r.returncode} n={len(lines)} last={lines[-1] if lines else r.stdout[:100]}",
     )
-    if BACKEND == "echo":
-        return  # echo takes no model: --model is a ConfigError, not a missing path
+    if BACKEND in ("echo", "kyutai"):
+        # echo takes no model; kyutai takes no local path: a ConfigError, not a missing path
+        return
     r = subprocess.run(
         [
             PY,
