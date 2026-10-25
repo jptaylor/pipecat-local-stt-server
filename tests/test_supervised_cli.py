@@ -66,6 +66,31 @@ def _finish(proc: subprocess.Popen) -> None:
         proc.wait(timeout=10)
 
 
+def _wait_stderr_line(proc: subprocess.Popen, match, timeout: float = 10.0) -> str | None:
+    """The first stderr line ``match`` accepts, or None on timeout or EOF.
+
+    Reads the pipe's fd directly. ``select`` on the buffered file object cannot
+    see lines already read into its buffer, so a marker that arrived in the same
+    read as an earlier log line was never found on a slow runner."""
+    assert proc.stderr is not None
+    fd = proc.stderr.fileno()
+    buf = b""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([fd], [], [], 0.25)
+        if not ready:
+            continue
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            return None
+        buf += chunk
+        for raw in buf.split(b"\n")[:-1]:
+            line = raw.decode(errors="replace")
+            if match(line):
+                return line
+    return None
+
+
 def test_ready_line_then_stdin_eof_stops():
     proc = _serve("--backend", "echo", "--host", "127.0.0.1", "--port", "0")
     try:
@@ -125,12 +150,7 @@ def test_supervised_stop_during_blocked_warmup_exits_without_ready(stop_kind):
     )
     try:
         assert proc.stderr is not None
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            ready, _, _ = select.select([proc.stderr], [], [], 0.25)
-            if ready and proc.stderr.readline() == b"warmup-blocked\n":
-                break
-        else:
+        if _wait_stderr_line(proc, lambda line: line == "warmup-blocked") is None:
             raise AssertionError("warm-up did not block in time")
 
         started = time.monotonic()
@@ -191,14 +211,9 @@ def test_stop_during_blocked_warmup_removes_socket_and_tmpdir(short_home, backen
     try:
         assert proc.stderr is not None
         tmpdir = None
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            ready, _, _ = select.select([proc.stderr], [], [], 0.25)
-            if ready:
-                line = proc.stderr.readline().decode()
-                if line.startswith("warmup-blocked "):
-                    tmpdir = line.split(" ", 1)[1].strip()
-                    break
+        line = _wait_stderr_line(proc, lambda line: line.startswith("warmup-blocked "))
+        if line is not None:
+            tmpdir = line.split(" ", 1)[1].strip()
         assert tmpdir, "warm-up did not block in time"
         assert sock.exists() and Path(tmpdir).is_dir()
 
@@ -279,12 +294,7 @@ def test_plain_serve_sigterm_during_slow_startup_exits_promptly():
     )
     try:
         assert proc.stderr is not None
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            ready, _, _ = select.select([proc.stderr], [], [], 0.25)
-            if ready and proc.stderr.readline() == b"starting\n":
-                break
-        else:
+        if _wait_stderr_line(proc, lambda line: line == "starting") is None:
             raise AssertionError("startup did not begin in time")
         proc.terminate()
         assert proc.wait(timeout=5) == 0
@@ -727,12 +737,7 @@ def test_stop_during_warmup_hard_exit_is_opt_in(hard):
     )
     try:
         assert proc.stderr is not None
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            ready, _, _ = select.select([proc.stderr], [], [], 0.25)
-            if ready and proc.stderr.readline() == b"warmup-blocked\n":
-                break
-        else:
+        if _wait_stderr_line(proc, lambda line: line == "warmup-blocked") is None:
             raise AssertionError("warm-up did not block in time")
         proc.terminate()
         assert proc.wait(timeout=5) == 0
