@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-25
+
 ### Added
 
 - **`docs/architecture.md`**: the server lifecycle state machine, the single-server lock, stop during startup, and the supervisor contract.
@@ -217,6 +219,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reporting a spurious running server.
 - `TranscriptionServer.listening_port()` returns `None` for a Unix socket
   instead of a character of its path.
+
+### Upgrade notes
+
+- Consumers that pin `pipecat-local-stt-server>=0.3.3,<0.4` (for example
+  onoats-bot) must widen the pin to take this release. They use only
+  `TranscriptionClient` and `stt_server.protocol`, which are unchanged.
+- Code that embeds `stt_server.server.serve()` or `TranscriptionServer` should
+  read the Changed section: the server is single-use after `shutdown()`,
+  `hard_exit_on_stop` defaults to `False`, and `import_backend()` raises
+  `ConfigError` for an unknown name.
+- A second `serve` for a Unix socket a live server owns now exits with
+  `EADDRINUSE` before loading a model; it never replaces the running server.
+- The `kyutai` extra conflicts with `mlx`, `parakeet` and `nemotron`: install it
+  in its own environment (`uv sync --extra kyutai`), and it needs Python 3.12.
+- See [docs/architecture.md](docs/architecture.md) for the lifecycle and the
+  supervisor contract.
 
 ## [0.3.3] - 2026-06-28
 
@@ -520,6 +538,7 @@ import name `stt_server`.
 - Wire protocol is unchanged: `PROTOCOL_VERSION == "0.1"`; the `server.hello`
   and `server.status` shapes are stable.
 
+[0.4.0]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.4.0
 [0.3.3]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.3.3
 [0.3.2]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.3.2
 [0.3.1]: https://github.com/vr000m/pipecat-local-stt-server/releases/tag/v0.3.1
