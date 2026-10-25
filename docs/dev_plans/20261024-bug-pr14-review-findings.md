@@ -195,7 +195,7 @@ sequenceDiagram
 - Explore found one supervised `ready` callback, one UDS listener preflight, and one local-model classification call site in the touched runtime files.
 - Red-state regressions reproduced the readiness hang, broad UDS error acceptance, and vacuous local-model success before runtime changes.
 - Focused post-fix gates: 9 supervised/readiness/preflight cases passed; all 26 prefetch tests passed; Ruff format and check passed.
-- The background full suite reached 344 passed and 3 skipped, but the sandbox denied TCP and UDS binds with `EPERM`, causing 36 failures and 15 setup errors. No failure asserted changed behavior.
+- Initial pass only (superseded by the per-round counts in the Round records below; the final suite is 639 passed, 3 skipped, 1 known failure): the background full suite reached 344 passed and 3 skipped, but the sandbox denied TCP and UDS binds with `EPERM`, causing 36 failures and 15 setup errors. No failure asserted changed behavior.
 
 ## Issues & Solutions
 
