@@ -10,7 +10,7 @@ update the row in the same change that updates the plan's `**Status**` line.
 | [justfile operator layer for STT LaunchAgents](20260607-feature-stt-agents-justfile.md) | Install & Packaging | ✅ Complete |
 | [STT vocabulary/prompt biasing on the wire protocol](20260607-feature-stt-prompt-biasing.md) | Wire Protocol / ASR Backends | ⬜ Not started — analysis/handoff only |
 | [UDS server-side trust-boundary hardening](20260626-feature-uds-trust-boundary-hardening.md) | Server Transport | ✅ Shipped — PR #13 merged 2026-06-28 |
-| [PR #14 review findings](20261024-bug-pr14-review-findings.md) | Server Runtime | ✅ Complete on `fix/pr14-review-findings` (plan's above-marker `Status` line awaits owner sign-off) |
+| [PR #14 review findings](20261024-bug-pr14-review-findings.md) | Server Runtime | ✅ Complete (PR #15) |
 
 ## Conventions
 

@@ -1,6 +1,6 @@
 # Bug: PR #14 review findings
 
-**Status:** In Progress
+**Status:** Complete
 **Component:** Server Runtime
 **Assigned to:** Codex
 **Priority:** High
@@ -21,7 +21,7 @@ PR #14 adds supervised serving, prefetch support, and the Kyutai backend. Review
 - Race supervised stop against both server startup and readiness preparation. Split warm-up from the irreversible `ready` publication, make stop dominant before publication, and move the cleanup boundary above both races. If a non-cancellable worker is still running when stop wins, exit promptly without emitting `ready`; that hard exit is the only cleanup bypass, while normal and cancellable paths shut down exactly once through `finally`.
 - Treat only `ECONNREFUSED` or `ENOENT` from a UDS connect probe as proof that a socket is stale. Timeout, `EAGAIN`, permission failures, and unknown errors are occupied/fatal and must not permit replacement.
 - Existing PR #13 socket-directory and peer-credential trust checks remain unchanged.
-- Strings beginning with `/`, `./`, `../`, or `~` are explicit local references; existing bare relative paths remain local, while other strings remain Hub repository IDs. Local references must be directories and satisfy the selected backend's `SnapshotSpec.required` patterns. Those patterns prove structural prefetch completeness, not every third-party loader semantic. Kyutai local paths are explicitly unsupported. Check mode reports `cached: false`; fetch mode emits an error.
+- Strings beginning with `/`, `./`, `../`, or `~` are explicit local references; existing bare relative paths remain local, while other strings remain Hub repository IDs. Local references must be directories and satisfy the selected backend's `SnapshotSpec.required` patterns. Those patterns prove structural prefetch completeness, not every third-party loader semantic. Kyutai local paths are explicitly unsupported. Check and fetch modes both emit a `ConfigError` error event.
 - Add focused regressions, run formatting/lint, and pass the full suite. Do not stage, commit, push, or change branches.
 
 ## Review Focus
@@ -153,24 +153,24 @@ sequenceDiagram
 
 ### Test Approach
 
-- [ ] Subprocess regression for EOF during blocked warm-up with a prompt-exit bound and no ready output; retain the existing blocked-startup coverage.
-- [ ] Lifecycle regression for the normal/cancellable path with exactly one shutdown.
-- [ ] Parameterized UDS regressions for stale, occupied, permission, and unknown errors with inode checks.
-- [ ] CLI regressions for missing, incomplete, and complete local paths in check and fetch modes, Kyutai rejection, and sentinel-pattern reuse.
-- [ ] Ruff and full pytest suite.
+- [x] Subprocess regression for EOF during blocked warm-up with a prompt-exit bound and no ready output; retain the existing blocked-startup coverage.
+- [x] Lifecycle regression for the normal/cancellable path with exactly one shutdown.
+- [x] Parameterized UDS regressions for stale, occupied, permission, and unknown errors with inode checks.
+- [x] CLI regressions for missing, incomplete, and complete local paths in check and fetch modes, Kyutai rejection, and sentinel-pattern reuse.
+- [x] Ruff and full pytest suite.
 
 ### Test Results
 
-- [ ] Focused tests pass.
-- [ ] Ruff format and lint pass.
-- [ ] Full suite passes.
+- [x] Focused tests pass.
+- [x] Ruff format and lint pass.
+- [x] Full suite passes.
 
 ### Edge Cases Tested
 
-- [ ] Stop arrives after bind but before warm-up completes.
-- [ ] Probe timeout and full-backlog-style `EAGAIN` preserve the socket inode.
-- [ ] Missing and incomplete local paths cannot become vacuous success.
-- [ ] Kyutai local paths are rejected explicitly.
+- [x] Stop arrives after bind but before warm-up completes.
+- [x] Probe timeout and full-backlog-style `EAGAIN` preserve the socket inode.
+- [x] Missing and incomplete local paths cannot become vacuous success.
+- [x] Kyutai local paths are rejected explicitly.
 
 ## Acceptance Criteria
 
@@ -180,7 +180,7 @@ sequenceDiagram
 - Ruff and the full test suite pass.
 - Worktree changes remain unstaged and uncommitted on `fix/pr14-review-findings`.
 
-<!-- reviewed: 2026-10-24 @ c0c81648f0aabb87f533de8c8ddf914549959d28 -->
+<!-- reviewed: 2026-10-25 @ 94b64342ec5c04420480e64eea558ff259f096bd -->
 
 ## Progress
 
@@ -334,9 +334,10 @@ on a worker thread still releases the lock on unwind -- no current backend
 loads in `start()` (they load on first decode), and tracking it needs a
 `start()`-side hook.
 
-Needs owner decision (above the review marker, left untouched): the `Status:`
-line still reads In Progress, and Requirements say Kyutai local paths report
-`cached: false` in check mode while the code (and tests) report `ConfigError`.
+Owner decision, resolved before merge (2026-10-25): the `Status:` line now
+reads Complete, and the Kyutai requirement says check and fetch both emit a
+`ConfigError` error event, matching the code and tests. The marker hash was
+recomputed for those above-marker edits (administrative).
 
 ### Round 4 (review gauntlet)
 
