@@ -101,7 +101,8 @@ def test_import_backend_is_the_single_lookup(monkeypatch):
     monkeypatch.setattr(M, "BACKENDS", {})
     M._make_backend("echo", None)
     PF.specs_for("echo", None)
-    PF.local_specs_for("echo", "/tmp/x")
+    with pytest.raises(ConfigError, match="takes no model"):
+        PF.local_specs_for("echo", "/tmp/x")  # echo has no model: refused after the lookup
     assert seen == ["echo", "echo", "echo"]
 
 
